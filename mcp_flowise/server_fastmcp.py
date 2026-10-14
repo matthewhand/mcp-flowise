@@ -13,6 +13,7 @@ text result, so a broken deployment can never be mistaken for a valid answer.
 from __future__ import annotations
 
 import json
+import sys
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -110,4 +111,8 @@ def run_simple_server(config: Optional[FlowiseConfig] = None, client: Optional[F
 
 
 if __name__ == "__main__":  # pragma: no cover - manual invocation
-    run_simple_server()
+    try:
+        run_simple_server()
+    except ConfigError as exc:
+        print(f"[mcp-flowise] configuration error: {exc.message}", file=sys.stderr)
+        sys.exit(1)

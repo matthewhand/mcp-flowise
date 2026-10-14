@@ -27,7 +27,7 @@ from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 
 from mcp_flowise.config import FlowiseConfig, validate_question
-from mcp_flowise.errors import DiscoveryError, FlowiseError
+from mcp_flowise.errors import ConfigError, DiscoveryError, FlowiseError
 from mcp_flowise.utils import (
     ChatflowRecord,
     FlowiseClient,
@@ -262,5 +262,8 @@ def run_server(config: Optional[FlowiseConfig] = None, client: Optional[FlowiseC
 
 
 if __name__ == "__main__":  # pragma: no cover - manual invocation
-    run_server()
-    sys.exit(0)
+    try:
+        run_server()
+    except ConfigError as exc:
+        print(f"[mcp-flowise] configuration error: {exc.message}", file=sys.stderr)
+        sys.exit(1)

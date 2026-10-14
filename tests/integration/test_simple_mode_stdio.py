@@ -52,7 +52,7 @@ class TestSimpleModeProtocol(SimpleModeTestCase):
             self.assertEqual(payload["sessionId"], "session-mock")
             return names
 
-        names = run_session(self.env(), body)
+        run_session(self.env(), body)
         self.assertEqual(self.mock.prediction_calls, 1)
         self.assertEqual(self.mock.state.prediction_paths(), ["/api/v1/prediction/cf-alpha"])
 

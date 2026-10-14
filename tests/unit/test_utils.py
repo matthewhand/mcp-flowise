@@ -8,8 +8,6 @@ import logging
 import sys
 import unittest
 
-import requests
-
 from fake_http import FakeResponse, FakeSession, connection_error, timeout_error
 from mcp_flowise.config import load_config
 from mcp_flowise.errors import (
