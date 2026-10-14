@@ -1,57 +1,61 @@
-"""
-Entry point for the mcp_flowise package.
+"""Entry point for mcp-flowise.
 
-This script determines which server to run based on the presence of 
-the FLOWISE_SIMPLE_MODE environment variable:
-- Low-Level Server: For dynamic tool creation based on chatflows.
-- FastMCP Server: For static tool configurations.
+The mode is resolved from configuration *before* anything else: no chatflow
+discovery is performed here, so a misconfigured endpoint or an invalid filter
+fails fast with a sanitized message on stderr instead of a stray network call
+(and, in simple mode, instead of blocking startup on an unreachable Flowise).
+
+Exit codes:
+    0 - the server ran and shut down cleanly
+    1 - invalid configuration, or the server could not start
 """
 
-import os
+from __future__ import annotations
+
 import sys
-from dotenv import load_dotenv
-from mcp_flowise.utils import setup_logging
-from mcp_flowise.utils import fetch_chatflows
 
-# Load environment variables from .env if present
-load_dotenv()
+from mcp_flowise.config import MODE_LOWLEVEL, MODE_SIMPLE, load_config
+from mcp_flowise.errors import ConfigError
+from mcp_flowise.utils import get_logger, setup_logging
 
-def main():
-    """
-    Main entry point for the mcp_flowise package.
 
-    Depending on the FLOWISE_SIMPLE_MODE environment variable, this function
-    launches either:
-    - Low-Level Server (dynamic tools)
-    - FastMCP Server (static tools)
-    """
-    # Configure logging
-    DEBUG = os.getenv("DEBUG", "").lower() in ("true", "1", "yes")
-    logger = setup_logging(debug=DEBUG)
-
-    logger.debug("Starting mcp_flowise package entry point.")
-
-    chatflows = fetch_chatflows()
-    logger.debug(f"Available chatflows: {chatflows}")
-
-    # Default to Simple Mode unless explicitly disabled
-    FLOWISE_SIMPLE_MODE = os.getenv("FLOWISE_SIMPLE_MODE", "true").lower() not in ("false", "0", "no")
-    if FLOWISE_SIMPLE_MODE:
-        logger.debug("FLOWISE_SIMPLE_MODE is enabled. Launching FastMCP Server.")
-        from mcp_flowise.server_fastmcp import run_simple_server
-        selected_server = run_simple_server
-    else:
-        logger.debug("FLOWISE_SIMPLE_MODE is disabled. Launching Low-Level Server.")
-        from mcp_flowise.server_lowlevel import run_server
-        selected_server = run_server
-
-    # Run the selected server
+def main() -> int:
+    """Load configuration and run the selected server."""
     try:
-        selected_server()
-    except Exception as e:
-        logger.critical("Unhandled exception occurred while running the server.", exc_info=True)
-        sys.exit(1)
+        config = load_config()
+    except ConfigError as exc:
+        # stderr keeps stdout free for the MCP JSON-RPC stream.
+        print(f"[mcp-flowise] configuration error: {exc.message}", file=sys.stderr)
+        return 1
+
+    setup_logging(debug=config.debug)
+    logger = get_logger("main")
+    logger.debug("Starting mcp-flowise (mode=%s, endpoint=%s).", config.mode, config.endpoint)
+
+    try:
+        if config.mode == MODE_LOWLEVEL:
+            from mcp_flowise.server_lowlevel import run_server
+
+            run_server(config)
+        elif config.mode == MODE_SIMPLE:
+            from mcp_flowise.server_fastmcp import run_simple_server
+
+            run_simple_server(config)
+        else:  # pragma: no cover - guarded by config validation
+            raise ConfigError(f"Unsupported mode '{config.mode}'")
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    except ConfigError as exc:
+        print(f"[mcp-flowise] configuration error: {exc.message}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:  # pragma: no cover - interactive
+        logger.debug("Interrupted.")
+        return 0
+    except Exception:
+        logger.critical("Unhandled exception while running the server.", exc_info=True)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,41 +1,112 @@
-"""
-Utility functions for mcp_flowise, including logging setup, chatflow filtering, and Flowise API interactions.
+"""Logging, chatflow discovery and the Flowise HTTP client for mcp-flowise.
 
-This module centralizes shared functionality such as:
-1. Logging configuration for consistent log output across the application.
-2. Safe redaction of sensitive data like API keys in logs.
-3. Low-level interactions with the Flowise API for predictions and chatflow management.
-4. Flexible filtering of chatflows based on whitelist/blacklist criteria.
+Design rules enforced here:
+
+* **stdout belongs to the MCP stdio transport.** Every diagnostic - including
+  ERROR/CRITICAL records - is written to stderr (or to an explicit log file).
+* **No secrets in logs.** API keys are never logged, questions are never
+  logged, and upstream request/response bodies are never logged.
+* **Errors are typed and sanitized.** Timeouts, connection failures, non-2xx
+  statuses, malformed JSON and discovery failures are distinct exceptions;
+  upstream bodies are not relayed to clients.
 """
 
-import os
-import sys
+from __future__ import annotations
+
 import logging
-import requests
+import os
 import re
-import json
-from dotenv import load_dotenv
+import sys
+import threading
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import quote, urlsplit, urlunsplit
 
-# Load environment variables from .env if present
-load_dotenv()
+import requests
 
-# Flowise API configuration
-FLOWISE_API_KEY = os.getenv("FLOWISE_API_KEY", "")
-FLOWISE_API_ENDPOINT = os.getenv("FLOWISE_API_ENDPOINT", "http://localhost:3000")
+from mcp_flowise.config import (
+    FilterPolicy,
+    FlowiseConfig,
+    load_config,
+    normalize_id,
+    validate_question,
+)
+from mcp_flowise.errors import (
+    ConfigError,
+    DiscoveryError,
+    FlowiseConnectionError,
+    FlowiseError,
+    FlowiseHttpError,
+    FlowiseTimeoutError,
+    MalformedResponseError,
+    PolicyDeniedError,
+)
+
+__all__ = [
+    "LOGGER_NAME",
+    "ChatflowDirectory",
+    "ChatflowRecord",
+    "FlowiseClient",
+    "RuntimeContext",
+    "ToolCatalog",
+    "filter_chatflows",
+    "flowise_predict",
+    "fetch_chatflows",
+    "get_context",
+    "get_logger",
+    "normalize_tool_name",
+    "redact_api_key",
+    "reset_context",
+    "set_context",
+    "setup_logging",
+]
+
+LOGGER_NAME = "mcp_flowise"
+DEFAULT_LOG_FILE = "debug-mcp-flowise.log"
 
 
-def setup_logging(debug: bool = False, log_dir: str = None, log_file: str = "debug-mcp-flowise.log") -> logging.Logger:
+class _StderrHandler(logging.StreamHandler):
+    """Stream handler that always writes to the *current* ``sys.stderr``.
+
+    ``sys.stdout`` is reserved for the MCP JSON-RPC stream and must never
+    receive log records, so the stream is resolved at emit time instead of at
+    handler construction time.
     """
-    Sets up logging for the application, including outputting CRITICAL and ERROR logs to stdout.
+
+    def __init__(self) -> None:
+        super().__init__(stream=sys.stderr)
+
+    @property  # type: ignore[override]
+    def stream(self):
+        return sys.stderr
+
+    @stream.setter
+    def stream(self, value) -> None:  # noqa: D401 - trivial
+        # Ignore assignments so the handler cannot be pointed at stdout.
+        return None
+
+
+def setup_logging(
+    debug: bool = False,
+    log_dir: Optional[str] = None,
+    log_file: str = DEFAULT_LOG_FILE,
+) -> logging.Logger:
+    """Configure stderr/file logging for the whole package.
+
+    Handlers replaced by a previous call are closed, so repeated setup (tests,
+    re-entrant entry points) does not leak file descriptors.
 
     Args:
-        debug (bool): If True, set log level to DEBUG; otherwise, INFO.
-        log_dir (str): Directory where log files will be stored. Ignored if `FLOWISE_LOGFILE_PATH` is set.
-        log_file (str): Name of the log file. Ignored if `FLOWISE_LOGFILE_PATH` is set.
+        debug: Emit DEBUG records as well as INFO.
+        log_dir: Directory for the log file. Ignored when
+            ``FLOWISE_LOGFILE_PATH`` is set.
+        log_file: Log file name. Ignored when ``FLOWISE_LOGFILE_PATH`` is set.
 
     Returns:
-        logging.Logger: Configured logger instance.
+        The configured ``mcp_flowise`` logger.
     """
+    level = logging.DEBUG if debug else logging.INFO
+
     log_path = os.getenv("FLOWISE_LOGFILE_PATH")
     if not log_path:
         if log_dir is None:
@@ -43,229 +114,401 @@ def setup_logging(debug: bool = False, log_dir: str = None, log_file: str = "deb
         try:
             os.makedirs(log_dir, exist_ok=True)
             log_path = os.path.join(log_dir, log_file)
-        except PermissionError as e:
-            # Fallback to stdout logging if directory creation fails
+        except OSError as exc:
+            print(f"[mcp-flowise] Log directory unavailable, logging to stderr only: {exc}", file=sys.stderr)
             log_path = None
-            print(f"[ERROR] Failed to create log directory: {e}", file=sys.stderr)
 
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.DEBUG if debug else logging.INFO)
-    logger.propagate = False  # Prevent log messages from propagating to the root logger
+    logger = logging.getLogger(LOGGER_NAME)
+    logger.setLevel(level)
+    logger.propagate = False
 
-    # Remove all existing handlers to prevent accumulation
-    for handler in logger.handlers[:]:
+    replaced = list(logger.handlers)
+    for handler in replaced:
         logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:  # pragma: no cover - defensive
+            pass
 
-    handlers = []
+    formatter = logging.Formatter("[%(levelname)s] %(asctime)s %(name)s - %(message)s")
 
     if log_path:
         try:
-            file_handler = logging.FileHandler(log_path, mode="a")
-            file_handler.setLevel(logging.DEBUG if debug else logging.INFO)
-            formatter = logging.Formatter("[%(levelname)s] %(asctime)s - %(message)s")
+            file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+            file_handler.setLevel(level)
             file_handler.setFormatter(formatter)
-            handlers.append(file_handler)
-        except Exception as e:
-            print(f"[ERROR] Failed to create log file handler: {e}", file=sys.stderr)
+            logger.addHandler(file_handler)
+        except OSError as exc:
+            print(f"[mcp-flowise] Log file unavailable, logging to stderr only: {exc}", file=sys.stderr)
 
-    # Attempt to create StreamHandler for ERROR level logs
-    try:
-        stdout_handler = logging.StreamHandler(sys.stdout)
-        stdout_handler.setLevel(logging.ERROR)
-        formatter = logging.Formatter("[%(levelname)s] %(message)s")
-        stdout_handler.setFormatter(formatter)
-        handlers.append(stdout_handler)
-    except Exception as e:
-        print(f"[ERROR] Failed to create stdout log handler: {e}", file=sys.stderr)
+    stderr_handler = _StderrHandler()
+    stderr_handler.setLevel(level)
+    stderr_handler.setFormatter(formatter)
+    logger.addHandler(stderr_handler)
 
-    # Add all handlers to the logger
-    for handler in handlers:
-        logger.addHandler(handler)
-
-    if log_path:
-        logger.debug(f"Logging initialized. Writing logs to {log_path}")
-    else:
-        logger.debug("Logging initialized. Logs will only appear in stdout.")
+    logger.debug("Logging initialised (stderr%s).", " + file" if log_path else "")
     return logger
 
 
-def redact_api_key(key: str) -> str:
-    """
-    Redacts the Flowise API key for safe logging output.
+def get_logger(name: Optional[str] = None) -> logging.Logger:
+    """Return the package logger (or one of its children)."""
+    if not name or name == LOGGER_NAME:
+        return logging.getLogger(LOGGER_NAME)
+    if name.startswith(f"{LOGGER_NAME}."):
+        return logging.getLogger(name)
+    return logging.getLogger(f"{LOGGER_NAME}.{name}")
 
-    Args:
-        key (str): The API key to redact.
 
-    Returns:
-        str: The redacted API key or '<not set>' if the key is invalid.
-    """
+def redact_api_key(key: Optional[str]) -> str:
+    """Return a non-reversible representation of an API key."""
     if not key or len(key) <= 4:
         return "<not set>"
     return f"{key[:2]}{'*' * (len(key) - 4)}{key[-2:]}"
 
 
-def normalize_tool_name(name: str) -> str:
-    """
-    Normalize tool names by converting to lowercase and replacing non-alphanumeric characters with underscores.
+def safe_url(url: str) -> str:
+    """Strip credentials, query string and fragment from a URL for logging."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:  # pragma: no cover - defensive
+        return "<unparsable url>"
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, "", ""))
 
-    Args:
-        name (str): Original tool name.
 
-    Returns:
-        str: Normalized tool name. Returns 'unknown_tool' if the input is invalid.
-    """
-    logger = logging.getLogger(__name__)
+def normalize_tool_name(name: Any) -> str:
+    """Normalize a chatflow name into a tool name (lowercase + underscores)."""
+    logger = get_logger("tools")
     if not name or not isinstance(name, str):
-        logger.warning("Invalid tool name input: %s. Using default 'unknown_tool'.", name)
+        logger.warning("Invalid tool name input: %s. Using default 'unknown_tool'.", type(name).__name__)
         return "unknown_tool"
     normalized = re.sub(r"[^a-zA-Z0-9]", "_", name).lower()
-    logger.debug("Normalized tool name from '%s' to '%s'", name, normalized)
-    return normalized or "unknown_tool"
+    if not normalized:
+        logger.warning("Chatflow name normalized to an empty tool name; using 'unknown_tool'.")
+        return "unknown_tool"
+    return normalized
 
 
-def filter_chatflows(chatflows: list[dict]) -> list[dict]:
-    """
-    Filters chatflows based on whitelist and blacklist criteria.
-    Whitelist takes precedence over blacklist.
+class FlowiseClient:
+    """Thin, typed HTTP client for the Flowise API."""
 
-    Args:
-        chatflows (list[dict]): A list of chatflow dictionaries.
+    def __init__(self, config: FlowiseConfig, session: Optional[requests.Session] = None) -> None:
+        self._config = config
+        self._session = session or requests.Session()
+        self._logger = get_logger("client")
 
-    Returns:
-        list[dict]: Filtered list of chatflows.
-    """
-    logger = logging.getLogger(__name__)
+    @property
+    def config(self) -> FlowiseConfig:
+        return self._config
 
-    # Dynamically fetch filtering criteria
-    whitelist_ids = set(filter(bool, os.getenv("FLOWISE_WHITELIST_ID", "").split(",")))
-    blacklist_ids = set(filter(bool, os.getenv("FLOWISE_BLACKLIST_ID", "").split(",")))
-    whitelist_name_regex = os.getenv("FLOWISE_WHITELIST_NAME_REGEX", "")
-    blacklist_name_regex = os.getenv("FLOWISE_BLACKLIST_NAME_REGEX", "")
+    def _send(self, method: str, url: str, *, json_body: Optional[Mapping[str, Any]] = None):
+        """Perform an HTTP request and translate transport/status failures."""
+        headers = self._config.auth_headers() if json_body is not None else self._config.read_headers()
+        self._logger.debug("%s %s", method, safe_url(url))
+        try:
+            response = self._session.request(
+                method,
+                url,
+                json=json_body,
+                headers=headers,
+                timeout=self._config.timeout,
+            )
+        except requests.Timeout:
+            raise FlowiseTimeoutError(f"Flowise API timed out after {self._config.timeout:g}s") from None
+        except requests.ConnectionError:
+            raise FlowiseConnectionError(f"Could not connect to Flowise API at {self._config.endpoint}") from None
+        except requests.RequestException as exc:
+            raise FlowiseConnectionError(
+                f"Flowise API request failed ({type(exc).__name__}) for {self._config.endpoint}"
+            ) from None
 
-    filtered_chatflows = []
+        status = response.status_code
+        if not 200 <= status < 300:
+            # The upstream body is intentionally discarded: Flowise returns HTML
+            # error pages and JSON error payloads that must not reach clients.
+            self._logger.warning("Flowise API returned HTTP %s for %s", status, safe_url(url))
+            raise FlowiseHttpError(f"Flowise API returned HTTP {status}", status_code=status)
+        return response
 
-    for chatflow in chatflows:
-        chatflow_id = chatflow.get("id", "")
-        chatflow_name = chatflow.get("name", "")
+    @staticmethod
+    def _decode_json(response: Any) -> Any:
+        try:
+            return response.json()
+        except ValueError:
+            content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip()
+            raise MalformedResponseError(
+                f"Flowise API returned a non-JSON response (content-type: {content_type or 'unknown'})"
+            ) from None
 
-        # Flags to determine inclusion
-        is_whitelisted = False
+    def list_chatflows(self) -> List[Dict[str, str]]:
+        """Return every chatflow exposed by the API (``id``/``name`` only)."""
+        url = f"{self._config.endpoint}/api/v1/chatflows"
+        response = self._send("GET", url)
+        payload = self._decode_json(response)
+        if not isinstance(payload, list):
+            raise MalformedResponseError("Flowise API returned a chatflow catalog that is not a JSON array")
 
-        # Check Whitelist
-        if whitelist_ids or whitelist_name_regex:
-            if whitelist_ids and chatflow_id in whitelist_ids:
-                is_whitelisted = True
-            if whitelist_name_regex and re.search(whitelist_name_regex, chatflow_name):
-                is_whitelisted = True
-
-            if is_whitelisted:
-                # If whitelisted, include regardless of blacklist
-                logger.debug("Including whitelisted chatflow '%s' (ID: '%s').", chatflow_name, chatflow_id)
-                filtered_chatflows.append(chatflow)
-                continue  # Skip blacklist checks
-            else:
-                # If not whitelisted, exclude regardless of blacklist
-                logger.debug("Excluding non-whitelisted chatflow '%s' (ID: '%s').", chatflow_name, chatflow_id)
+        chatflows: List[Dict[str, str]] = []
+        for entry in payload:
+            if not isinstance(entry, dict):
+                self._logger.warning("Skipping non-object entry in chatflow catalog")
                 continue
-        else:
-            # If no whitelist, apply blacklist directly
-            if blacklist_ids and chatflow_id in blacklist_ids:
-                logger.debug("Skipping chatflow '%s' (ID: '%s') - In blacklist.", chatflow_name, chatflow_id)
-                continue  # Exclude blacklisted by ID
-            if blacklist_name_regex and re.search(blacklist_name_regex, chatflow_name):
-                logger.debug("Skipping chatflow '%s' (ID: '%s') - Name matches blacklist regex.", chatflow_name, chatflow_id)
-                continue  # Exclude blacklisted by name
+            raw_id = entry.get("id")
+            if raw_id is None or (isinstance(raw_id, str) and not raw_id.strip()):
+                self._logger.warning("Skipping chatflow catalog entry without an id")
+                continue
+            chatflows.append({"id": str(raw_id).strip(), "name": str(entry.get("name") or "")})
+        return chatflows
 
-            # Include the chatflow if it passes all filters
-            logger.debug("Including chatflow '%s' (ID: '%s').", chatflow_name, chatflow_id)
-            filtered_chatflows.append(chatflow)
+    def predict(self, chatflow_id: str, question: str) -> Dict[str, Any]:
+        """POST a question to ``chatflow_id`` and return the decoded JSON body.
 
-    logger.debug("Filtered chatflows: %d out of %d", len(filtered_chatflows), len(chatflows))
-    return filtered_chatflows
+        Successful payloads are returned unchanged so that every field Flowise
+        provides is preserved for the MCP client.
+        """
+        url = f"{self._config.endpoint}/api/v1/prediction/{quote(chatflow_id, safe='')}"
+        response = self._send("POST", url, json_body={"question": question})
+        payload = self._decode_json(response)
+        if not isinstance(payload, dict):
+            raise MalformedResponseError("Flowise API returned a prediction result that is not a JSON object")
+        return payload
 
-def flowise_predict(chatflow_id: str, question: str) -> str:
+
+@dataclass(frozen=True)
+class ChatflowRecord:
+    """A chatflow as known to the server."""
+
+    id: str
+    name: str
+
+    def as_dict(self) -> Dict[str, str]:
+        return {"id": self.id, "name": self.name}
+
+
+class ChatflowDirectory:
+    """Cached chatflow catalog with policy-aware authorization.
+
+    The directory performs *discovery* (``GET /api/v1/chatflows``) lazily: only
+    when the configured policy needs the catalog to authorize a target. This is
+    what keeps FastMCP mode from touching the network at startup unless a
+    filter actually requires catalog authorization.
     """
-    Sends a question to a specific chatflow ID via the Flowise API and returns the response JSON text.
 
-    Args:
-        chatflow_id (str): The ID of the Flowise chatflow to be used.
-        question (str): The question or prompt to send to the chatflow.
+    def __init__(self, client: FlowiseClient, policy: FilterPolicy) -> None:
+        self._client = client
+        self._policy = policy
+        self._logger = get_logger("directory")
+        self._lock = threading.Lock()
+        self._records: Optional[Tuple[Tuple[ChatflowRecord, ...], Dict[str, str]]] = None
 
-    Returns:
-        str: The raw JSON response text from the Flowise API, or an error message if something goes wrong.
+    @property
+    def policy(self) -> FilterPolicy:
+        return self._policy
+
+    @property
+    def loaded(self) -> bool:
+        with self._lock:
+            return self._records is not None
+
+    def _store(self, allowed: Sequence[ChatflowRecord], index: Mapping[str, str]) -> Tuple[Tuple[ChatflowRecord, ...], Dict[str, str]]:
+        snapshot = (tuple(allowed), dict(index))
+        with self._lock:
+            self._records = snapshot
+        return snapshot
+
+    def refresh(self) -> Tuple[Tuple[ChatflowRecord, ...], Dict[str, str]]:
+        """Re-read the catalog from Flowise and atomically replace the cache.
+
+        Raises:
+            DiscoveryError: the catalog could not be retrieved. Callers must
+                never treat this as "the catalog is now empty".
+        """
+        try:
+            chatflows = self._client.list_chatflows()
+        except FlowiseError as exc:
+            self._logger.error("Chatflow discovery failed (%s): %s", exc.code, exc.message)
+            raise DiscoveryError(
+                f"Could not retrieve the chatflow catalog from {self._client.config.endpoint}",
+                cause=exc.code,
+            ) from None
+
+        index: Dict[str, str] = {}
+        records: List[ChatflowRecord] = []
+        for chatflow in chatflows:
+            index[chatflow["id"]] = chatflow["name"]
+            if self._policy.allows(chatflow["id"], chatflow["name"]):
+                records.append(ChatflowRecord(id=chatflow["id"], name=chatflow["name"]))
+            else:
+                self._logger.debug("Chatflow '%s' excluded by filter policy.", chatflow["id"])
+        snapshot = self._store(records, index)
+        self._logger.debug(
+            "Chatflow catalog refreshed: %d exposed of %d known.", len(records), len(index)
+        )
+        return snapshot
+
+    def snapshot(self) -> Tuple[Tuple[ChatflowRecord, ...], Dict[str, str]]:
+        """Return the cached snapshot, discovering once if needed."""
+        with self._lock:
+            cached = self._records
+        if cached is None:
+            return self.refresh()
+        return cached
+
+    def records(self) -> Tuple[ChatflowRecord, ...]:
+        return self.snapshot()[0]
+
+    def lookup(self, chatflow_id: str) -> Optional[ChatflowRecord]:
+        """Return the chatflow record for ``chatflow_id`` (refresh on miss)."""
+        with self._lock:
+            cached = self._records
+        if cached is not None and chatflow_id in cached[1]:
+            return ChatflowRecord(id=chatflow_id, name=cached[1][chatflow_id])
+        allowed, index = self.refresh()
+        del allowed
+        name = index.get(chatflow_id)
+        if name is None:
+            return None
+        return ChatflowRecord(id=chatflow_id, name=name)
+
+    def authorize(self, chatflow_id: str, *, source: str = "tool call") -> ChatflowRecord:
+        """Authorize a prediction target, failing closed.
+
+        When no filter is configured the target is accepted as-is (no network
+        access). Otherwise the target must be known to Flowise *and* allowed by
+        the policy. Any failure raises before a prediction request is sent.
+        """
+        try:
+            identifier = normalize_id(chatflow_id, field_name="chatflow_id")
+        except ConfigError as exc:
+            raise PolicyDeniedError(f"Invalid chatflow id rejected by {source}: {exc.message}") from None
+        if not identifier:
+            raise PolicyDeniedError(f"No chatflow id provided for {source}")
+
+        if not self._policy.enabled:
+            return ChatflowRecord(id=identifier, name="")
+
+        record = self.lookup(identifier)
+        if record is None:
+            raise PolicyDeniedError(
+                f"Chatflow '{identifier}' is unknown to Flowise and cannot be authorized by the filter policy"
+            )
+        if not self._policy.allows(record.id, record.name):
+            raise PolicyDeniedError(
+                f"Chatflow '{identifier}' is not permitted by the configured filter policy"
+            )
+        return record
+
+
+class ToolCatalog:
+    """Atomically swapped tool list + name -> chatflow ID mapping.
+
+    Tools and the mapping are always replaced together, so a refreshed catalog
+    can never leave stale, still-callable tool names behind.
     """
-    logger = logging.getLogger(__name__)
 
-    # Construct the Flowise API URL for predictions
-    url = f"{FLOWISE_API_ENDPOINT.rstrip('/')}/api/v1/prediction/{chatflow_id}"
-    headers = {
-        "Content-Type": "application/json",
-    }
-    if FLOWISE_API_KEY:
-        headers["Authorization"] = f"Bearer {FLOWISE_API_KEY}"
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._tools: Tuple[Any, ...] = ()
+        self._mapping: Dict[str, str] = {}
 
-    payload = {"question": question}
-    logger.debug(f"Sending prediction request to {url} with payload: {payload}")
+    def replace(self, tools: Sequence[Any], mapping: Mapping[str, str]) -> Tuple[Any, ...]:
+        with self._lock:
+            self._tools = tuple(tools)
+            self._mapping = dict(mapping)
+            return self._tools
 
-    try:
-        # Send POST request to the Flowise API
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
-        logger.debug(f"Prediction response code: HTTP {response.status_code}")
-        # response.raise_for_status()
+    def tools(self) -> Tuple[Any, ...]:
+        with self._lock:
+            return self._tools
 
-        # Log the raw response text for debugging
-        logger.debug(f"Raw prediction response: {response.text}")
+    def resolve(self, tool_name: str) -> Optional[str]:
+        with self._lock:
+            return self._mapping.get(tool_name)
 
-        # Return the raw JSON response text
-        return response.text
+    def mapping(self) -> Dict[str, str]:
+        with self._lock:
+            return dict(self._mapping)
 
-    #except requests.exceptions.RequestException as e:
-    except Exception as e:
-        # Log and return an error message
-        logger.error(f"Error during prediction: {e}")
-        return json.dumps({"error": str(e)})
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._tools)
 
 
-def fetch_chatflows() -> list[dict]:
+@dataclass
+class RuntimeContext:
+    """Everything the servers need to talk to Flowise under one policy."""
+
+    config: FlowiseConfig
+    client: FlowiseClient
+    directory: ChatflowDirectory
+
+
+_context_lock = threading.Lock()
+_context: Optional[RuntimeContext] = None
+
+
+def get_context(config: Optional[FlowiseConfig] = None, client: Optional[FlowiseClient] = None) -> RuntimeContext:
+    """Return the process-wide runtime context, creating it on first use."""
+    global _context
+    with _context_lock:
+        if config is not None or client is not None:
+            _context = _build_context(config or load_config(), client)
+        elif _context is None:
+            _context = _build_context(load_config(), None)
+        return _context
+
+
+def _build_context(config: FlowiseConfig, client: Optional[FlowiseClient]) -> RuntimeContext:
+    resolved_client = client or FlowiseClient(config)
+    return RuntimeContext(
+        config=config,
+        client=resolved_client,
+        directory=ChatflowDirectory(resolved_client, config.policy),
+    )
+
+
+def set_context(context: Optional[RuntimeContext]) -> None:
+    """Install (or clear) the process-wide runtime context."""
+    global _context
+    with _context_lock:
+        _context = context
+
+
+def reset_context() -> None:
+    """Drop the cached runtime context (used by tests)."""
+    set_context(None)
+
+
+def filter_chatflows(chatflows: Iterable[Mapping[str, Any]], policy: Optional[FilterPolicy] = None) -> List[Dict[str, str]]:
+    """Apply the configured whitelist/blacklist policy to ``chatflows``."""
+    active = policy if policy is not None else load_config().policy
+    return active.filter_chatflows(chatflows)
+
+
+def fetch_chatflows(policy: Optional[FilterPolicy] = None, client: Optional[FlowiseClient] = None) -> List[Dict[str, str]]:
+    """Discover and filter chatflows.
+
+    Raises:
+        DiscoveryError: when Flowise cannot be reached or returns garbage.
+            An empty list is returned **only** for a genuinely empty catalog.
     """
-    Fetch a list of all chatflows from the Flowise API.
+    context = get_context(client=client)
+    directory = context.directory if policy is None else ChatflowDirectory(context.client, policy)
+    return [record.as_dict() for record in directory.records()]
 
-    Returns:
-        list of dict: Each dict contains the 'id' and 'name' of a chatflow.
-                      Returns an empty list if there's an error.
+
+def flowise_predict(chatflow_id: str, question: str, config: Optional[FlowiseConfig] = None) -> Dict[str, Any]:
+    """Authorize and send a prediction, returning the decoded JSON payload.
+
+    Raises:
+        ConfigError: the question is invalid.
+        PolicyDeniedError: the target is not permitted (no request is sent).
+        FlowiseTimeoutError / FlowiseConnectionError / FlowiseHttpError /
+        MalformedResponseError: transport or upstream protocol problems.
     """
-    logger = logging.getLogger(__name__)
-
-    # Construct the Flowise API URL for fetching chatflows
-    url = f"{FLOWISE_API_ENDPOINT.rstrip('/')}/api/v1/chatflows"
-    headers = {}
-    if FLOWISE_API_KEY:
-        headers["Authorization"] = f"Bearer {FLOWISE_API_KEY}"
-
-    logger.debug(f"Fetching chatflows from {url}")
-
-    try:
-        # Send GET request to the Flowise API
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-
-        # Parse and simplify the response data
-        chatflows_data = response.json()
-        simplified_chatflows = [{"id": cf["id"], "name": cf["name"]} for cf in chatflows_data]
-
-        logger.debug(f"Fetched chatflows: {simplified_chatflows}")
-        return filter_chatflows(simplified_chatflows)
-    #except requests.exceptions.RequestException as e:
-    except Exception as e:
-        # Log and return an empty list on error
-        logger.error(f"Error fetching chatflows: {e}")
-        return []
-
-
-# Set up logging before obtaining the logger
-DEBUG = os.getenv("DEBUG", "").lower() in ("true", "1", "yes")
-logger = setup_logging(debug=DEBUG)
-
-# Log key environment variable values
-logger.debug(f"Flowise API Key (redacted): {redact_api_key(FLOWISE_API_KEY)}")
-logger.debug(f"Flowise API Endpoint: {FLOWISE_API_ENDPOINT}")
+    context = get_context(config=config) if config is not None else get_context()
+    question = validate_question(question)
+    record = context.directory.authorize(chatflow_id)
+    return context.client.predict(record.id, question)

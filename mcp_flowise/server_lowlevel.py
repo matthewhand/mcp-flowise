@@ -1,236 +1,266 @@
-'''
-Low-Level Server for the Flowise MCP.
+"""Low-level (dynamic) mode server for mcp-flowise.
 
-This server dynamically registers tools based on the provided chatflows
-retrieved from the Flowise API. Tool names are normalized for safety 
-and consistency, and potential conflicts are logged.
+One MCP tool is generated per Flowise chatflow. The catalog is discovered at
+startup (a dynamic server cannot advertise tools it has never seen) and refreshed
+atomically on every ``tools/list`` call: the tool list *and* the
+name -> chatflow ID mapping are replaced together, so a tool name that
+disappeared from Flowise stops being callable instead of silently keeping its
+old target.
 
-Descriptions for tools are prioritized from FLOWISE_CHATFLOW_DESCRIPTIONS,
-falling back to the chatflow names when not provided.
+Tool names come from the chatflow names (``FLOWISE_CHATFLOW_DESCRIPTIONS``
+overrides the description). Only chatflows allowed by the filter policy are ever
+registered, and dispatch re-checks the policy against the current catalog before
+issuing a prediction POST.
+"""
 
-Conflicts in tool names after normalization are handled gracefully by
-skipping those chatflows.
-'''
+from __future__ import annotations
 
-import os
-import sys
 import asyncio
 import json
-from typing import List, Dict, Any
+import os
+import sys
+from typing import Any, Dict, List, Mapping, Optional, Tuple
+
 from mcp import types
 from mcp.server.lowlevel import Server
 from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
+
+from mcp_flowise.config import FlowiseConfig, validate_question
+from mcp_flowise.errors import DiscoveryError, FlowiseError
 from mcp_flowise.utils import (
-    flowise_predict,
-    fetch_chatflows,
+    ChatflowRecord,
+    FlowiseClient,
+    RuntimeContext,
+    ToolCatalog,
+    get_context,
+    get_logger,
     normalize_tool_name,
     setup_logging,
 )
 
-# Configure logging
-DEBUG = os.getenv("DEBUG", "").lower() in ("true", "1", "yes")
-logger = setup_logging(debug=DEBUG)
+SERVER_NAME = "FlowiseMCP-with-EnvAuth"
+SERVER_VERSION = "0.1.0"
 
-# Global tool mapping: tool name to chatflow ID
-NAME_TO_ID_MAPPING: Dict[str, str] = {}
-tools: List[types.Tool] = []
+logger = get_logger("lowlevel")
 
-# Initialize the Low-Level MCP Server
-mcp = Server("FlowiseMCP-with-EnvAuth")
+mcp = Server(SERVER_NAME)
+
+catalog = ToolCatalog()
+_context: Optional[RuntimeContext] = None
 
 
-def get_chatflow_descriptions() -> Dict[str, str]:
-    """
-    Parse the FLOWISE_CHATFLOW_DESCRIPTIONS environment variable for descriptions.
+def get_server_context() -> RuntimeContext:
+    """Return the runtime context, creating it from the environment if needed."""
+    global _context
+    if _context is None:
+        _context = get_context()
+    return _context
 
-    Returns:
-        dict: A dictionary mapping chatflow IDs to descriptions.
-    """
-    descriptions_env = os.getenv("FLOWISE_CHATFLOW_DESCRIPTIONS", "")
-    if not descriptions_env:
-        logger.debug("No FLOWISE_CHATFLOW_DESCRIPTIONS provided.")
+
+def set_server_context(context: Optional[RuntimeContext]) -> None:
+    """Install (or clear) the context used by this module."""
+    global _context
+    _context = context
+
+
+def get_chatflow_descriptions(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+    """Parse ``FLOWISE_CHATFLOW_DESCRIPTIONS`` (``id:description`` pairs)."""
+    environ = os.environ if env is None else env
+    raw = environ.get("FLOWISE_CHATFLOW_DESCRIPTIONS") or ""
+    if not raw.strip():
         return {}
 
-    logger.debug("Retrieved FLOWISE_CHATFLOW_DESCRIPTIONS: %s", descriptions_env)
-    descriptions = {}
-    for pair in descriptions_env.split(","):
-        if ":" not in pair:
-            logger.warning("Invalid format in FLOWISE_CHATFLOW_DESCRIPTIONS: %s", pair)
+    descriptions: Dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
             continue
-        chatflow_id, description = map(str.strip, pair.split(":", 1))
-        if chatflow_id and description:
-            descriptions[chatflow_id] = description
-    logger.debug("Parsed FLOWISE_CHATFLOW_DESCRIPTIONS: %s", descriptions)
+        if ":" not in pair:
+            logger.warning("Ignoring malformed FLOWISE_CHATFLOW_DESCRIPTIONS entry (expected 'id:description')")
+            continue
+        raw_id, description = pair.split(":", 1)
+        identifier = raw_id.strip()
+        description = description.strip()
+        if identifier and description:
+            descriptions[identifier] = description
     return descriptions
 
 
-async def dispatcher_handler(request: types.CallToolRequest) -> types.ServerResult:
+def build_tool(chatflow: ChatflowRecord, descriptions: Mapping[str, str]) -> types.Tool:
+    """Build the MCP tool definition for a chatflow record."""
+    description = descriptions.get(chatflow.id) or chatflow.name
+    return types.Tool(
+        name=normalize_tool_name(chatflow.name),
+        description=description,
+        inputSchema={
+            "type": "object",
+            "required": ["question"],
+            "properties": {"question": {"type": "string", "minLength": 1}},
+        },
+    )
+
+
+def register_tools(
+    records: List[ChatflowRecord], descriptions: Mapping[str, str]
+) -> Tuple[List[types.Tool], Dict[str, str]]:
+    """Build and atomically install the tool catalog.
+
+    Tools and the dispatch mapping are swapped in one step under a lock, so the
+    mapping can never keep pointing at chatflows that are no longer exposed.
+
+    Returns:
+        ``(tools, mapping)`` for the freshly installed catalog.
     """
-    Dispatcher handler that routes CallToolRequest to the appropriate tool handler based on the tool name.
-    """
-    try:
-        tool_name = request.params.name
-        logger.debug("Dispatcher received CallToolRequest for tool: %s", tool_name)
-
-        if tool_name not in NAME_TO_ID_MAPPING:
-            logger.error("Unknown tool requested: %s", tool_name)
-            return types.ServerResult(
-                root=types.CallToolResult(
-                    content=[types.TextContent(type="text", text="Unknown tool requested")]
-                )
-            )
-
-        chatflow_id = NAME_TO_ID_MAPPING[tool_name]
-        question = request.params.arguments.get("question", "")
-        if not question:
-            logger.error("Missing 'question' argument for tool: %s", tool_name)
-            return types.ServerResult(
-                root=types.CallToolResult(
-                    content=[types.TextContent(type="text", text="Missing 'question' argument.")]
-                )
-            )
-
-        logger.debug("Dispatching prediction for chatflow_id: %s with question: %s", chatflow_id, question)
-
-        # Call the prediction function
+    tools: List[types.Tool] = []
+    mapping: Dict[str, str] = {}
+    for record in records:
         try:
-            result = flowise_predict(chatflow_id, question)
-            logger.debug("Prediction result: %s", result)
-        except Exception as pred_err:
-            logger.error("Error during prediction: %s", pred_err, exc_info=True)
-            result = json.dumps({"error": "Error occurred during prediction."})
+            tool = build_tool(record, descriptions)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("Skipping chatflow '%s' (ID: '%s'): %s", record.name, record.id, exc)
+            continue
+        if tool.name in mapping:
+            logger.warning(
+                "Tool name conflict: '%s' already exists. Skipping chatflow '%s' (ID: '%s').",
+                tool.name,
+                record.name,
+                record.id,
+            )
+            continue
+        mapping[tool.name] = record.id
+        tools.append(tool)
+        logger.debug("Registered tool: %s (ID: %s)", tool.name, record.id)
 
-        # Pass the raw JSON response or error JSON back to the client
-        return types.ServerResult(
-            root=types.CallToolResult(
-                content=[types.TextContent(type="text", text=result)]
-            )
+    installed = catalog.replace(tools, mapping)
+    return list(installed), dict(mapping)
+
+
+def refresh_catalog(context: Optional[RuntimeContext] = None, descriptions: Optional[Mapping[str, str]] = None) -> Tuple[List[types.Tool], Dict[str, str]]:
+    """Re-discover the chatflows and atomically replace the catalog.
+
+    Raises:
+        DiscoveryError: Flowise could not be reached. The previously installed
+            catalog is left untouched - a broken endpoint must never be
+            reported as "this server has no tools".
+    """
+    ctx = context or get_server_context()
+    allowed, _index = ctx.directory.refresh()
+    return register_tools(list(allowed), descriptions if descriptions is not None else get_chatflow_descriptions())
+
+
+def _error_result(payload: Mapping[str, Any]) -> types.ServerResult:
+    """Build an ``isError`` tool result carrying a sanitized JSON payload."""
+    return types.ServerResult(
+        root=types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(payload))], isError=True)
+    )
+
+
+def _error_payload(exc: FlowiseError) -> Dict[str, Any]:
+    logger.error("%s: %s", exc.code, exc.message)
+    return exc.to_payload()
+
+
+async def dispatcher_handler(request: types.CallToolRequest) -> types.ServerResult:
+    """Route ``tools/call`` to the chatflow currently mapped to the tool name."""
+    tool_name = request.params.name
+    chatflow_id = catalog.resolve(tool_name)
+    if chatflow_id is None:
+        # Covers both unknown names and names that were dropped by the last
+        # catalog refresh: the mapping is the single source of truth.
+        return _error_result(
+            {"error": "unknown_tool", "message": f"Tool '{tool_name}' is not part of the current chatflow catalog"}
         )
-    except Exception as e:
-        logger.error("Unhandled exception in dispatcher_handler: %s", e, exc_info=True)
-        return types.ServerResult(
-            root=types.CallToolResult(
-                content=[types.TextContent(type="text", text=json.dumps({"error": "Internal server error."}))]  # Ensure JSON is returned
-            )
-        )
+
+    arguments = request.params.arguments or {}
+    question = arguments.get("question")
+    try:
+        question = validate_question(question)
+    except FlowiseError as exc:
+        return _error_result(exc.to_payload())
+
+    context = get_server_context()
+    try:
+        # Re-authorize against the live catalog: zero prediction POSTs when the
+        # target is unknown to Flowise or excluded by the filter policy.
+        record = context.directory.authorize(chatflow_id, source=f"tool '{tool_name}'")
+        payload = context.client.predict(record.id, question)
+    except FlowiseError as exc:
+        return _error_result(_error_payload(exc))
+    except Exception:  # pragma: no cover - defensive
+        logger.error("Unhandled exception while dispatching tool '%s'.", tool_name, exc_info=True)
+        return _error_result({"error": "internal_error", "message": "Unexpected internal error"})
+
+    return types.ServerResult(root=types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps(payload))]))
 
 
 async def list_tools(request: types.ListToolsRequest) -> types.ServerResult:
+    """Return the current tool catalog, refreshing it from Flowise first.
+
+    A failed refresh keeps the last known good catalog (and is reported on
+    stderr); it never empties the catalog.
     """
-    Handler for ListToolsRequest to list all registered tools.
-
-    Args:
-        request (types.ListToolsRequest): The request to list tools.
-
-    Returns:
-        types.ServerResult: The result containing the list of tools.
-    """
-    logger.debug("Handling list_tools request.")
-    return types.ServerResult(root=types.ListToolsResult(tools=tools))
-
-
-def register_tools(chatflows: List[Dict[str, Any]], chatflow_descriptions: Dict[str, str]) -> List[types.Tool]:
-    """
-    Register tools dynamically based on the provided chatflows.
-
-    Args:
-        chatflows (List[Dict[str, Any]]): List of chatflows retrieved from the Flowise API.
-        chatflow_descriptions (Dict[str, str]): Dictionary mapping chatflow IDs to descriptions.
-
-    Returns:
-        List[types.Tool]: List of registered tools.
-    """
-    global tools
-    tools = []  # Clear existing tools before re-registration
-    for chatflow in chatflows:
-        try:
-            normalized_name = normalize_tool_name(chatflow["name"])
-
-            if normalized_name in NAME_TO_ID_MAPPING:
-                logger.warning(
-                    "Tool name conflict: '%s' already exists. Skipping chatflow '%s' (ID: '%s').",
-                    normalized_name,
-                    chatflow["name"],
-                    chatflow["id"],
-                )
-                continue
-
-            NAME_TO_ID_MAPPING[normalized_name] = chatflow["id"]
-            description = chatflow_descriptions.get(chatflow["id"], chatflow["name"])
-
-            tool = types.Tool(
-                name=normalized_name,
-                description=description,
-                inputSchema={
-                    "type": "object",
-                    "required": ["question"],
-                    "properties": {"question": {"type": "string"}},
-                },
-            )
-            tools.append(tool)
-            logger.debug("Registered tool: %s (ID: %s)", tool.name, chatflow["id"])
-
-        except Exception as e:
-            logger.error("Error registering chatflow '%s' (ID: '%s'): %s", chatflow["name"], chatflow["id"], e)
-
-    return tools
-
-
-async def start_server():
-    """
-    Start the Low-Level MCP server.
-    """
-    logger.debug("Starting Low-Level MCP server...")
+    context = get_server_context()
     try:
-        async with stdio_server() as (read_stream, write_stream):
-            await mcp.run(
-                read_stream,
-                write_stream,
-                initialization_options=InitializationOptions(
-                    server_name="FlowiseMCP-with-EnvAuth",
-                    server_version="0.1.0",
-                    capabilities=types.ServerCapabilities(),
-                ),
-            )
-    except Exception as e:
-        logger.critical("Unhandled exception in MCP server: %s", e)
-        sys.exit(1)
+        refresh_catalog(context)
+    except DiscoveryError as exc:
+        logger.error("Keeping previous tool catalog: %s", exc.message)
+    return types.ServerResult(root=types.ListToolsResult(tools=list(catalog.tools())))
 
 
-def run_server():
-    """
-    Run the Low-Level Flowise server by registering tools dynamically.
-    """
-    try:
-        chatflows = fetch_chatflows()
-        if not chatflows:
-            raise ValueError("No chatflows retrieved from the Flowise API.")
-    except Exception as e:
-        logger.critical("Failed to start server: %s", e)
-        sys.exit(1)
-
-    chatflow_descriptions = get_chatflow_descriptions()
-    register_tools(chatflows, chatflow_descriptions)
-
-    if not tools:
-        logger.critical("No valid tools registered. Shutting down the server.")
-        sys.exit(1)
-
+def register_handlers() -> None:
+    """Wire the request handlers onto the low-level server."""
     mcp.request_handlers[types.CallToolRequest] = dispatcher_handler
-    logger.debug("Registered dispatcher_handler for CallToolRequest.")
-
     mcp.request_handlers[types.ListToolsRequest] = list_tools
-    logger.debug("Registered list_tools handler.")
+    logger.debug("Registered low-level request handlers.")
+
+
+async def start_server() -> None:
+    """Serve the MCP protocol over stdio."""
+    async with stdio_server() as (read_stream, write_stream):
+        await mcp.run(
+            read_stream,
+            write_stream,
+            initialization_options=InitializationOptions(
+                server_name=SERVER_NAME,
+                server_version=SERVER_VERSION,
+                capabilities=types.ServerCapabilities(),
+            ),
+        )
+
+
+def run_server(config: Optional[FlowiseConfig] = None, client: Optional[FlowiseClient] = None) -> None:
+    """Discover chatflows, install the tool catalog and serve over stdio."""
+    context = get_context(config=config, client=client)
+    set_server_context(context)
+    setup_logging(debug=context.config.debug)
+    logger.debug("Starting LowLevel MCP server (endpoint=%s).", context.config.endpoint)
+
+    try:
+        refresh_catalog(context)
+    except DiscoveryError as exc:
+        logger.critical("Cannot start: %s (%s)", exc.message, exc.cause)
+        raise SystemExit(1) from None
+
+    tool_count = len(catalog)
+    if tool_count == 0:
+        # A legitimately empty catalog (no chatflows, or all filtered out) is
+        # not a startup failure: the server is up and answers tools/list.
+        logger.warning("No chatflow passed the filter policy; starting with an empty tool catalog.")
+    else:
+        logger.debug("Registered %d tool(s).", tool_count)
+
+    register_handlers()
 
     try:
         asyncio.run(start_server())
-    except KeyboardInterrupt:
-        logger.debug("MCP server shutdown initiated by user.")
-    except Exception as e:
-        logger.critical("Failed to start MCP server: %s", e)
-        sys.exit(1)
+    except KeyboardInterrupt:  # pragma: no cover - interactive
+        logger.debug("Server shutdown requested.")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.critical("Failed to start MCP server: %s", exc)
+        raise SystemExit(1) from None
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - manual invocation
     run_server()
+    sys.exit(0)

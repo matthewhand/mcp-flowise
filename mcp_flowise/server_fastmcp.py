@@ -1,118 +1,112 @@
-"""
-Provides the FastMCP server logic for mcp_flowise.
+"""FastMCP (simple) mode server for mcp-flowise.
 
-This server exposes a limited set of tools (list_chatflows, create_prediction)
-and uses environment variables to determine the chatflow or assistant configuration.
+Exposes two static tools, ``list_chatflows`` and ``create_prediction``. Neither
+performs startup discovery: the Flowise API is contacted only when a tool call
+actually needs it (and, when a filter policy is configured, when a target has to
+be authorized against the catalog).
+
+Every failure is surfaced to the client as an MCP tool error
+(``isError: true``) carrying a sanitized JSON payload - never as an ordinary
+text result, so a broken deployment can never be mistaken for a valid answer.
 """
 
-import os
-import sys
+from __future__ import annotations
+
 import json
+from typing import Optional
+
 from mcp.server.fastmcp import FastMCP
-from mcp_flowise.utils import flowise_predict, fetch_chatflows, redact_api_key, setup_logging
+from mcp.server.fastmcp.exceptions import ToolError
 
-# Environment variables
-FLOWISE_API_KEY = os.getenv("FLOWISE_API_KEY", "")
-FLOWISE_API_ENDPOINT = os.getenv("FLOWISE_API_ENDPOINT", "http://localhost:3000")
-FLOWISE_CHATFLOW_ID = os.getenv("FLOWISE_CHATFLOW_ID")
-FLOWISE_ASSISTANT_ID = os.getenv("FLOWISE_ASSISTANT_ID")
-FLOWISE_CHATFLOW_DESCRIPTION = os.getenv("FLOWISE_CHATFLOW_DESCRIPTION")
-FLOWISE_CHATFLOW_WHITELIST = os.getenv("FLOWISE_CHATFLOW_WHITELIST")
-FLOWISE_CHATFLOW_BLACKLIST = os.getenv("FLOWISE_CHATFLOW_BLACKLIST")
+from mcp_flowise.config import FlowiseConfig, validate_question
+from mcp_flowise.errors import ConfigError, FlowiseError
+from mcp_flowise.utils import FlowiseClient, RuntimeContext, get_context, get_logger, setup_logging
 
-DEBUG = os.getenv("DEBUG", "").lower() in ("true", "1", "yes")
+SERVER_NAME = "FlowiseMCP-with-EnvAuth"
 
-# Configure logging
-logger = setup_logging(debug=DEBUG)
+logger = get_logger("fastmcp")
 
-# Log key environment variable values
-logger.debug(f"Flowise API Key (redacted): {redact_api_key(FLOWISE_API_KEY)}")
-logger.debug(f"Flowise API Endpoint: {FLOWISE_API_ENDPOINT}")
-logger.debug(f"Flowise Chatflow ID: {FLOWISE_CHATFLOW_ID}")
-logger.debug(f"Flowise Assistant ID: {FLOWISE_ASSISTANT_ID}")
-logger.debug(f"Flowise Chatflow Description: {FLOWISE_CHATFLOW_DESCRIPTION}")
+mcp = FastMCP(SERVER_NAME)
 
-# Initialize MCP Server
-mcp = FastMCP("FlowiseMCP-with-EnvAuth")
+
+def _context() -> RuntimeContext:
+    return get_context()
+
+
+def _tool_error(exc: FlowiseError) -> ToolError:
+    """Convert a typed error into a sanitized MCP tool error."""
+    if isinstance(exc, FlowiseError):
+        payload = exc.to_payload()
+        logger.error("%s: %s", exc.code, exc.message)
+    else:  # pragma: no cover - defensive
+        payload = {"error": "internal_error", "message": "Unexpected internal error"}
+        logger.error("Unexpected internal error", exc_info=True)
+    return ToolError(json.dumps(payload))
 
 
 @mcp.tool()
 def list_chatflows() -> str:
-    """
-    List all available chatflows from the Flowise API.
+    """List the chatflows this server is allowed to use.
 
-    This function respects optional whitelisting or blacklisting if configured
-    via FLOWISE_CHATFLOW_WHITELIST or FLOWISE_CHATFLOW_BLACKLIST.
+    Honors the configured whitelist/blacklist policy
+    (``FLOWISE_WHITELIST_ID``, ``FLOWISE_BLACKLIST_ID``,
+    ``FLOWISE_WHITELIST_NAME_REGEX``, ``FLOWISE_BLACKLIST_NAME_REGEX``).
 
     Returns:
-        str: A JSON-encoded string of filtered chatflows.
+        A JSON array of ``{"id": ..., "name": ...}`` objects. An empty array
+        means Flowise really has no chatflow left after filtering; any failure
+        is reported as an MCP tool error instead.
     """
-    logger.debug("Handling list_chatflows tool.")
-    chatflows = fetch_chatflows()
-
-    # Apply whitelisting
-    if FLOWISE_CHATFLOW_WHITELIST:
-        whitelist = set(FLOWISE_CHATFLOW_WHITELIST.split(","))
-        chatflows = [cf for cf in chatflows if cf["id"] in whitelist]
-        logger.debug(f"Applied whitelist filter: {whitelist}")
-
-    # Apply blacklisting
-    if FLOWISE_CHATFLOW_BLACKLIST:
-        blacklist = set(FLOWISE_CHATFLOW_BLACKLIST.split(","))
-        chatflows = [cf for cf in chatflows if cf["id"] not in blacklist]
-        logger.debug(f"Applied blacklist filter: {blacklist}")
-
-    logger.debug(f"Filtered chatflows: {chatflows}")
-    return json.dumps(chatflows)
+    context = _context()
+    try:
+        directory = context.directory
+        records = directory.records()
+        return json.dumps([record.as_dict() for record in records])
+    except FlowiseError as exc:
+        raise _tool_error(exc) from None
 
 
 @mcp.tool()
-def create_prediction(*, chatflow_id: str = None, question: str) -> str:
-    """
-    Create a prediction by sending a question to a specific chatflow or assistant.
+def create_prediction(*, question: str, chatflow_id: Optional[str] = None) -> str:
+    """Send a question to a Flowise chatflow and return the raw JSON answer.
 
     Args:
-        chatflow_id (str, optional): The ID of the chatflow to use. Defaults to FLOWISE_CHATFLOW_ID.
-        question (str): The question or prompt to send to the chatflow.
+        question: The question or prompt to send to the chatflow.
+        chatflow_id: Chatflow to query. Defaults to ``FLOWISE_CHATFLOW_ID``.
+            When a filter policy is configured the id must be allowed by it.
 
     Returns:
-        str: The raw JSON response from Flowise API or an error message if something goes wrong.
+        The JSON payload returned by Flowise, with all of its fields intact.
     """
-    logger.debug(f"create_prediction called with chatflow_id={chatflow_id}, question={question}")
-    chatflow_id = chatflow_id or FLOWISE_CHATFLOW_ID
-
-    if not chatflow_id and not FLOWISE_ASSISTANT_ID:
-        logger.error("No chatflow_id or assistant_id provided or pre-configured.")
-        return json.dumps({"error": "chatflow_id or assistant_id is required"})
-
+    context = _context()
     try:
-        # Determine which chatflow ID to use
-        target_chatflow_id = chatflow_id or FLOWISE_ASSISTANT_ID
+        question = validate_question(question)
+        target = chatflow_id or context.config.chatflow_id
+        if not target:
+            raise ConfigError(
+                "No chatflow_id argument was provided and FLOWISE_CHATFLOW_ID is not configured"
+            )
+        # Authorization happens before any prediction POST is issued.
+        record = context.directory.authorize(target, source="create_prediction")
+        payload = context.client.predict(record.id, question)
+        return json.dumps(payload)
+    except FlowiseError as exc:
+        raise _tool_error(exc) from None
 
-        # Call the prediction function and return the raw JSON result
-        result = flowise_predict(target_chatflow_id, question)
-        logger.debug(f"Prediction result: {result}")
-        return result  # Returning raw JSON as a string
-    except Exception as e:
-        logger.error(f"Unhandled exception in create_prediction: {e}", exc_info=True)
-        return json.dumps({"error": str(e)})
 
-def run_simple_server():
-    """
-    Run the FastMCP version of the Flowise server.
-
-    This function ensures proper configuration and handles server initialization.
-
-    Raises:
-        SystemExit: If both FLOWISE_CHATFLOW_ID and FLOWISE_ASSISTANT_ID are set simultaneously.
-    """
-    if FLOWISE_CHATFLOW_ID and FLOWISE_ASSISTANT_ID:
-        logger.error("Both FLOWISE_CHATFLOW_ID and FLOWISE_ASSISTANT_ID are set. Set only one.")
-        sys.exit(1)
-
+def run_simple_server(config: Optional[FlowiseConfig] = None, client: Optional[FlowiseClient] = None) -> None:
+    """Run the FastMCP server over stdio."""
+    context = get_context(config=config, client=client)
+    setup_logging(debug=context.config.debug)
+    logger.debug("Starting FastMCP server (mode=simple, endpoint=%s).", context.config.endpoint)
     try:
-        logger.debug("Starting MCP server (FastMCP version)...")
         mcp.run(transport="stdio")
-    except Exception as e:
-        logger.error("Unhandled exception in MCP server.", exc_info=True)
-        sys.exit(1)
+    except KeyboardInterrupt:  # pragma: no cover - interactive
+        logger.debug("Server shutdown requested.")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.critical("Unhandled exception in MCP server: %s", exc)
+        raise SystemExit(1) from None
+
+
+if __name__ == "__main__":  # pragma: no cover - manual invocation
+    run_simple_server()
