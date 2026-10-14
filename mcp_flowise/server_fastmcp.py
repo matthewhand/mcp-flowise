@@ -59,9 +59,10 @@ def list_chatflows() -> str:
     """
     context = _context()
     try:
-        directory = context.directory
-        records = directory.records()
-        return json.dumps([record.as_dict() for record in records])
+        # Refreshed on every call so the listing reflects Flowise's current state
+        # (and so a discovery failure surfaces instead of serving a stale list).
+        allowed, _index = context.directory.refresh()
+        return json.dumps([record.as_dict() for record in allowed])
     except FlowiseError as exc:
         raise _tool_error(exc) from None
 

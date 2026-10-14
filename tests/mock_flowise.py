@@ -176,21 +176,29 @@ def _sleep(seconds: float) -> None:
 
 
 class MockFlowise:
-    """Context manager starting the mock on an ephemeral localhost port."""
+    """Context manager starting the mock on an ephemeral localhost port.
 
-    def __init__(self, state: Optional[MockState] = None) -> None:
+    ``host="0.0.0.0"`` is only needed when the server under test runs in a
+    container and has to reach the mock through ``host.docker.internal``.
+    """
+
+    def __init__(self, state: Optional[MockState] = None, host: str = "127.0.0.1") -> None:
         self.state = state or MockState()
+        self.host = host
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
     @property
-    def base_url(self) -> str:
+    def port(self) -> int:
         assert self._httpd is not None, "mock server not started"
-        host, port = self._httpd.server_address[:2]
-        return f"http://{host}:{port}"
+        return int(self._httpd.server_address[1])
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{'127.0.0.1' if self.host == '0.0.0.0' else self.host}:{self.port}"
 
     def start(self) -> "MockFlowise":
-        httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        httpd = ThreadingHTTPServer((self.host, 0), _Handler)
         httpd.daemon_threads = True
         httpd.state = self.state  # type: ignore[attr-defined]
         self._httpd = httpd

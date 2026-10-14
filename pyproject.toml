@@ -5,13 +5,23 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mcp-flowise"
 version = "0.1.0"
-description = "MCP integration with the Flowise API for creating predictions and managing chatflows/assistants"
+description = "MCP integration with the Flowise API for creating predictions and managing chatflows"
 readme = "README.md"
+requires-python = ">=3.12"
 authors = [
   { name = "Matthew Hand", email = "matthewhandau@gmail.com" }
 ]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "License :: OSI Approved :: MIT License",
+]
 dependencies = [
-  "mcp[cli]>=1.2.0",
+  # mcp 2.x removed mcp.server.fastmcp (FastMCP was renamed to MCPServer), so the
+  # upper bound keeps `uv sync`/`pip install` on an SDK this project runs on.
+  # The floor is the version this project is tested against (see tests/).
+  "mcp[cli]>=1.30.0,<2",
   "python-dotenv>=1.0.1",
   "requests>=2.25.0",
 ]

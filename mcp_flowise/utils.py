@@ -496,7 +496,8 @@ def fetch_chatflows(policy: Optional[FilterPolicy] = None, client: Optional[Flow
     """
     context = get_context(client=client)
     directory = context.directory if policy is None else ChatflowDirectory(context.client, policy)
-    return [record.as_dict() for record in directory.records()]
+    allowed, _index = directory.refresh()
+    return [record.as_dict() for record in allowed]
 
 
 def flowise_predict(chatflow_id: str, question: str, config: Optional[FlowiseConfig] = None) -> Dict[str, Any]:

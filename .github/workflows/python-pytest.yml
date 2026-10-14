@@ -6,34 +6,40 @@ on:
   pull_request:
     branches: [ main ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.12', '3.13']
 
     steps:
-      # Checkout the repository
       - uses: actions/checkout@v4
 
-      # Set up Python environment
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python-version }}
 
-      # Install uv
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
 
-      # Set up Python environment with uv
-      - name: Set up Python
-        run: uv python install
-
-      # Sync dependencies with uv
+      # Frozen install: exactly what uv.lock pins, so CI cannot drift.
       - name: Install dependencies
-        run: uv sync --all-extras --dev
+        run: uv sync --frozen
 
-      # Run tests
+      # The whole suite runs offline against the task-owned mock Flowise
+      # (tests/mock_flowise.py); no Flowise deployment or network egress needed.
+      # Live-deployment checks are skipped unless FLOWISE_API_* is provided.
       - name: Run tests
-        run: uv run pytest tests/unit
-        env:
-          PYTHONPATH: ${{ github.workspace }}
+        run: uv run --frozen pytest tests -q
+
+      - name: Show dependency versions used by CI
+        run: uv run --frozen python -c "import sys, importlib.metadata as m; print(sys.version); print('mcp', m.version('mcp'))"

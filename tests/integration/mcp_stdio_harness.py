@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, Mapping, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, Mapping, Optional, Sequence
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -103,6 +103,7 @@ def raw_protocol_exchange(
     *,
     timeout: float = 30.0,
     args: Optional[Iterable[str]] = None,
+    command: Optional[Sequence[str]] = None,
 ) -> "RawExchange":
     """Speak raw JSON-RPC to the server and capture *everything* it writes.
 
@@ -111,7 +112,7 @@ def raw_protocol_exchange(
     about protocol purity and secret hygiene.
     """
     proc = subprocess.Popen(
-        [sys.executable, *list(args or ["-m", "mcp_flowise"])],
+        list(command or [sys.executable, *list(args or ["-m", "mcp_flowise"])]),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -212,11 +213,15 @@ def _wait_for_response(chunks: list, request_id: int, deadline: float) -> str:
 
 
 def run_to_completion(
-    env: Mapping[str, str], *, timeout: float = 30.0, args: Optional[Iterable[str]] = None
+    env: Mapping[str, str],
+    *,
+    timeout: float = 30.0,
+    args: Optional[Iterable[str]] = None,
+    command: Optional[Sequence[str]] = None,
 ) -> RawExchange:
     """Start the server, let it fail or exit on its own, and capture its output."""
     proc = subprocess.Popen(
-        [sys.executable, *list(args or ["-m", "mcp_flowise"])],
+        list(command or [sys.executable, *list(args or ["-m", "mcp_flowise"])]),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

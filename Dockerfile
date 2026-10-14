@@ -1,24 +1,30 @@
-# Use a Python base image that satisfies the project requirements
+# mcp-flowise is a **stdio** MCP server: it speaks MCP JSON-RPC on stdin/stdout
+# and diagnostics go to stderr. It therefore exposes no HTTP port, and it must
+# be attached to an MCP client, not published.
+#
+# The image runs the checkout that was COPYied in - no `git clone`/`uvx --from
+# git+...` at start-up, and no credentials baked into the image. Pass
+# FLOWISE_API_KEY and FLOWISE_API_ENDPOINT through `docker run -e ...` or your
+# orchestrator.
+
 FROM python:3.12-slim AS base
 
-# Install the uv package manager
-RUN pip install uvx
+# uv provides `uv sync --frozen`, which installs exactly what uv.lock pins.
+COPY --from=ghcr.io/astral-sh/uv:0.6.6 /uv /uvx /bin/
 
-# Set the working directory in the container
 WORKDIR /app
 
-# Copy the current directory contents into the container at /app
-COPY . .
+# Dependency metadata first so dependency installation stays cached.
+COPY pyproject.toml uv.lock README.md ./
+RUN uv sync --frozen --no-dev --no-install-project
 
-# Install dependencies
-RUN uvx sync --frozen --no-dev --no-editable
+# Then the project itself, installed from this checkout.
+COPY mcp_flowise ./mcp_flowise
+RUN uv sync --frozen --no-dev
 
-# Expose the port the app runs on
-EXPOSE 8000
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1
 
-# Set environment variables required for running the MCP server
-ENV FLOWISE_API_KEY=your_api_key
-ENV FLOWISE_API_ENDPOINT=http://localhost:3000
-
-# Define the command to run the app
-CMD ["uvx", "--from", "git+https://github.com/matthewhand/mcp-flowise", "mcp-flowise"]
+# Stdout is the MCP transport; nothing else may write there.
+ENTRYPOINT ["mcp-flowise"]
+CMD []
