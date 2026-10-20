@@ -147,6 +147,17 @@ def request_timeout() -> float:
     return timeout
 
 
+def validate_filter_patterns() -> tuple[re.Pattern | None, re.Pattern | None]:
+    patterns = []
+    for variable in ("FLOWISE_WHITELIST_NAME_REGEX", "FLOWISE_BLACKLIST_NAME_REGEX"):
+        value = os.getenv(variable, "")
+        try:
+            patterns.append(re.compile(value) if value else None)
+        except re.error:
+            raise ValueError(f"{variable} must be a valid regular expression") from None
+    return patterns[0], patterns[1]
+
+
 def filter_chatflows(chatflows: list[dict]) -> list[dict]:
     """
     Filters chatflows based on whitelist and blacklist criteria.
@@ -163,8 +174,7 @@ def filter_chatflows(chatflows: list[dict]) -> list[dict]:
     # Dynamically fetch filtering criteria
     whitelist_ids = {value.strip() for value in os.getenv("FLOWISE_WHITELIST_ID", "").split(",") if value.strip()}
     blacklist_ids = {value.strip() for value in os.getenv("FLOWISE_BLACKLIST_ID", "").split(",") if value.strip()}
-    whitelist_name_regex = os.getenv("FLOWISE_WHITELIST_NAME_REGEX", "")
-    blacklist_name_regex = os.getenv("FLOWISE_BLACKLIST_NAME_REGEX", "")
+    whitelist_name_regex, blacklist_name_regex = validate_filter_patterns()
 
     filtered_chatflows = []
 
@@ -179,7 +189,7 @@ def filter_chatflows(chatflows: list[dict]) -> list[dict]:
         if whitelist_ids or whitelist_name_regex:
             if whitelist_ids and chatflow_id in whitelist_ids:
                 is_whitelisted = True
-            if whitelist_name_regex and re.search(whitelist_name_regex, chatflow_name):
+            if whitelist_name_regex and whitelist_name_regex.search(chatflow_name):
                 is_whitelisted = True
 
             if is_whitelisted:
@@ -196,7 +206,7 @@ def filter_chatflows(chatflows: list[dict]) -> list[dict]:
             if blacklist_ids and chatflow_id in blacklist_ids:
                 logger.debug("Skipping chatflow '%s' (ID: '%s') - In blacklist.", chatflow_name, chatflow_id)
                 continue  # Exclude blacklisted by ID
-            if blacklist_name_regex and re.search(blacklist_name_regex, chatflow_name):
+            if blacklist_name_regex and blacklist_name_regex.search(chatflow_name):
                 logger.debug("Skipping chatflow '%s' (ID: '%s') - Name matches blacklist regex.", chatflow_name, chatflow_id)
                 continue  # Exclude blacklisted by name
 

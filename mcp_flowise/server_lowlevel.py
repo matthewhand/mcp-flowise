@@ -42,16 +42,13 @@ tools: List[types.Tool] = []
 # Initialize the Low-Level MCP Server
 mcp = Server(advertised_server_name(), version=PACKAGE_VERSION)
 _tools_loaded = False
-_tools_load_lock: asyncio.Lock | None = None
+_tools_load_lock = asyncio.Lock()
 
 
 async def ensure_tools_loaded() -> None:
     """Delay Flowise I/O until discovery or a call; retry failed discovery on next request."""
-    global _tools_load_lock
     if _tools_loaded:
         return
-    if _tools_load_lock is None:
-        _tools_load_lock = asyncio.Lock()
     async with _tools_load_lock:
         if _tools_loaded:
             return

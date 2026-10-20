@@ -15,7 +15,7 @@ from mcp_flowise.protocol import advertised_server_name, list_annotations, predi
 @pytest.fixture
 def fresh_registry(monkeypatch):
     monkeypatch.setattr(dynamic, '_tools_loaded', False)
-    monkeypatch.setattr(dynamic, '_tools_load_lock', None)
+    monkeypatch.setattr(dynamic, '_tools_load_lock', asyncio.Lock())
     monkeypatch.setattr(dynamic, 'tools', [])
     monkeypatch.setattr(dynamic, 'NAME_TO_ID_MAPPING', {})
     monkeypatch.delenv('TOOL_NAME_PREFIX', raising=False)
@@ -124,3 +124,34 @@ def test_logs_are_optional_and_bounded(monkeypatch, tmp_path):
     assert files[0].maxBytes == 5 * 1024 * 1024 and files[0].backupCount == 2
     monkeypatch.delenv('FLOWISE_LOGFILE_PATH')
     utils.setup_logging()
+
+
+@pytest.mark.parametrize('variable', ['FLOWISE_WHITELIST_NAME_REGEX', 'FLOWISE_BLACKLIST_NAME_REGEX'])
+def test_invalid_filter_patterns_are_configuration_errors(monkeypatch, variable):
+    monkeypatch.setenv(variable, '[')
+    with pytest.raises(ValueError, match=variable):
+        utils.filter_chatflows([])
+
+
+def test_startup_configuration_error_has_no_traceback(monkeypatch, capsys):
+    from mcp_flowise.__main__ import main
+    monkeypatch.setenv('FLOWISE_HTTP_TIMEOUT', 'NaN')
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 1
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert 'Invalid configuration' in captured.err
+    assert 'Traceback' not in captured.err
+    utils.setup_logging()
+
+
+def test_cached_discovery_cannot_authorize_removed_flow(monkeypatch, fresh_registry):
+    dynamic.register_tools([{'id': 'flow', 'name': 'Flow'}], {})
+    monkeypatch.setattr(utils, 'fetch_chatflows', Mock(return_value=[]))
+    post = Mock()
+    monkeypatch.setattr(utils.requests, 'post', post)
+    request = types.CallToolRequest(method='tools/call', params=types.CallToolRequestParams(
+        name='flow', arguments={'question': 'hello'}))
+    assert asyncio.run(dynamic.dispatcher_handler(request)).root.isError
+    post.assert_not_called()
