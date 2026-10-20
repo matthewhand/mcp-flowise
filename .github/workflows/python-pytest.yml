@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python: ['3.12', '3.13']
+        python: ['3.13', '3.14']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,7 +17,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - uses: astral-sh/setup-uv@v4
         with:
-          version: '0.8.15'
+          version: '0.13.3'
       - name: Install locked dependencies
         run: uv sync --frozen --group dev --python ${{ matrix.python }}
       - name: Run offline suite including stdio protocol checks

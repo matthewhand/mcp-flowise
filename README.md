@@ -42,8 +42,8 @@ npx -y @smithery/cli install @matthewhand/mcp-flowise --client claude
 
 ### Prerequisites
 
-- Python 3.12 or higher
-- `uvx` package manager
+- Python 3.13 or higher (CI covers 3.13 and 3.14; Docker uses 3.14)
+- `uv` / `uvx` (tested with uv 0.13.3)
 
 ### Docker
 
