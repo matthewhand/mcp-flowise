@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/matthewhand-mcp-flowise-badge.png)](https://mseep.ai/app/matthewhand-mcp-flowise)
+
 # mcp-flowise
 
 [![smithery badge](https://smithery.ai/badge/@matthewhand/mcp-flowise)](https://smithery.ai/server/@matthewhand/mcp-flowise)
