@@ -33,6 +33,6 @@ The proxy's disk fallback for API descriptions is not used for Flowise visibilit
 
 ## Review and verification status
 
-The 0.1.2 follow-up passes **42 unit/local protocol checks** on Windows Python 3.12.9, including the added discovery, empty inventory, recovery, concurrent discovery, naming, timeout, logging and annotation regressions. Actual MCP subprocess initialization makes zero Flowise requests. Both modes advertise the configured identity and appropriate tool annotations.
+The 0.1.2 follow-up passes **46 unit/local protocol checks** on Windows Python 3.12.9, including the added discovery, empty inventory, recovery, concurrent discovery, naming, timeout, logging, annotation, invalid-regex, startup-error and revoked-visibility regressions. Actual MCP subprocess initialization makes zero Flowise requests. Both modes advertise the configured identity and appropriate tool annotations.
 
-The protected/unprotected live matrix also passed: four test executions with actual predictions against the existing Flowise service, covering both modes, filtering and invalid calls. A separate Linux Python 3.12.8 checkout passed the same 42 offline checks and four live test executions before rollout. The [earlier verification report](verification-2026-10-20.md) remains the baseline record for 0.1.1.
+The protected/unprotected live matrix also passed: four test executions with actual predictions against the existing Flowise service, covering both modes, filtering and invalid calls. A separate Linux Python 3.12.8 checkout passed the same 46 offline checks and four live test executions before rollout. The [earlier verification report](verification-2026-10-20.md) remains the baseline record for 0.1.1.

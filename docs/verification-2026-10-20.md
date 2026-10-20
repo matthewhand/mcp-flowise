@@ -1,6 +1,6 @@
 # Verification — 20 October 2026
 
-Verified source: **mcp-flowise 0.1.1**, code commit `3a1a17a` (documentation updated in `1e46419`). The proposed 0.1.2 comparison patch is not covered by these results; see [its review status](codebase-comparison.md#review-and-verification-status).
+Verified baseline: **mcp-flowise 0.1.1**, code commit `3a1a17a` (documentation updated in `1e46419`). Follow-up **0.1.2** verification is recorded separately in the [codebase comparison](codebase-comparison.md#review-and-verification-status).
 
 ## Environment and scope
 
