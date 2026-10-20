@@ -11,7 +11,7 @@ import os
 import sys
 from dotenv import load_dotenv
 from mcp_flowise.utils import setup_logging
-from mcp_flowise.utils import fetch_chatflows
+from mcp_flowise.utils import request_timeout, tool_name_prefix, validate_filter_patterns
 
 # Load environment variables from .env if present
 load_dotenv()
@@ -30,6 +30,13 @@ def main():
     logger = setup_logging(debug=DEBUG)
 
     logger.debug("Starting mcp_flowise package entry point.")
+    try:
+        request_timeout()
+        tool_name_prefix()
+        validate_filter_patterns()
+    except ValueError as error:
+        logger.critical("Invalid configuration: %s", error)
+        sys.exit(1)
 
     # Default to Simple Mode unless explicitly disabled
     FLOWISE_SIMPLE_MODE = os.getenv("FLOWISE_SIMPLE_MODE", "true").lower() not in ("false", "0", "no")

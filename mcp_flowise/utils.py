@@ -11,9 +11,11 @@ This module centralizes shared functionality such as:
 import os
 import sys
 import logging
+from logging.handlers import RotatingFileHandler
+import hashlib
+import math
 import requests
 import re
-import json
 from dotenv import load_dotenv
 
 # Load environment variables from .env if present
@@ -37,56 +39,27 @@ def setup_logging(debug: bool = False, log_dir: str = None, log_file: str = "deb
         logging.Logger: Configured logger instance.
     """
     log_path = os.getenv("FLOWISE_LOGFILE_PATH")
-    if not log_path:
-        if log_dir is None:
-            log_dir = os.path.join(os.path.expanduser("~"), "mcp_logs")
-        try:
-            os.makedirs(log_dir, exist_ok=True)
-            log_path = os.path.join(log_dir, log_file)
-        except PermissionError as e:
-            # Fallback to stdout logging if directory creation fails
-            log_path = None
-            print(f"[ERROR] Failed to create log directory: {e}", file=sys.stderr)
-
+    if not log_path and log_dir is not None:
+        log_path = os.path.join(log_dir, log_file)
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.DEBUG if debug else logging.INFO)
-    logger.propagate = False  # Prevent log messages from propagating to the root logger
-
-    # Remove all existing handlers to prevent accumulation
+    logger.propagate = False
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
         handler.close()
-
-    handlers = []
-
+    formatter = logging.Formatter("[%(levelname)s] %(asctime)s - %(message)s")
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(formatter)
+    logger.addHandler(stderr_handler)
     if log_path:
         try:
-            file_handler = logging.FileHandler(log_path, mode="a")
+            os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+            file_handler = RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8")
             file_handler.setLevel(logging.DEBUG if debug else logging.INFO)
-            formatter = logging.Formatter("[%(levelname)s] %(asctime)s - %(message)s")
             file_handler.setFormatter(formatter)
-            handlers.append(file_handler)
-        except Exception as e:
-            print(f"[ERROR] Failed to create log file handler: {e}", file=sys.stderr)
-
-    # Attempt to create StreamHandler for ERROR level logs
-    try:
-        stdout_handler = logging.StreamHandler(sys.stderr)
-        stdout_handler.setLevel(logging.ERROR)
-        formatter = logging.Formatter("[%(levelname)s] %(message)s")
-        stdout_handler.setFormatter(formatter)
-        handlers.append(stdout_handler)
-    except Exception as e:
-        print(f"[ERROR] Failed to create stdout log handler: {e}", file=sys.stderr)
-
-    # Add all handlers to the logger
-    for handler in handlers:
-        logger.addHandler(handler)
-
-    if log_path:
-        logger.debug(f"Logging initialized. Writing logs to {log_path}")
-    else:
-        logger.debug("Logging initialized. Logs will only appear in stderr.")
+            logger.addHandler(file_handler)
+        except OSError:
+            logger.warning("Could not open configured log file; diagnostics use stderr")
     return logger
 
 
@@ -117,11 +90,72 @@ def normalize_tool_name(name: str) -> str:
     """
     logger = logging.getLogger(__name__)
     if not name or not isinstance(name, str):
-        logger.warning("Invalid tool name input: %s. Using default 'unknown_tool'.", name)
-        return "unknown_tool"
+        logger.warning("Invalid tool name; using unknown_tool")
+        name = "unknown_tool"
     normalized = re.sub(r"[^a-zA-Z0-9]", "_", name).lower()
-    logger.debug("Normalized tool name from '%s' to '%s'", name, normalized)
-    return normalized[:64] or "unknown_tool"
+    logger.debug("Normalized tool name: %s", normalized)
+    prefix = tool_name_prefix()
+    return (prefix + (normalized or "unknown_tool"))[:tool_name_limit()]
+
+
+def tool_name_prefix() -> str:
+    prefix = os.getenv("TOOL_NAME_PREFIX", "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]*", prefix):
+        raise ValueError("TOOL_NAME_PREFIX must contain only letters, digits, underscores or hyphens")
+    if len(prefix) > tool_name_limit() - 10:
+        raise ValueError("TOOL_NAME_PREFIX must leave at least 10 characters for the tool name")
+    return prefix
+
+
+def tool_name_limit() -> int:
+    raw = os.getenv("TOOL_NAME_MAX_LENGTH", "64")
+    try:
+        limit = int(raw)
+    except ValueError:
+        raise ValueError("TOOL_NAME_MAX_LENGTH must be an integer from 16 to 64") from None
+    if not 16 <= limit <= 64:
+        raise ValueError("TOOL_NAME_MAX_LENGTH must be an integer from 16 to 64")
+    return limit
+
+
+def unique_tool_name(name: str, flow_id: str, registered_names: set[str]) -> str:
+    """Keep all colliding flows callable, including collisions with a generated suffix."""
+    if name not in registered_names:
+        return name
+    limit = tool_name_limit()
+    digest = hashlib.sha256(flow_id.encode()).hexdigest()
+    counter = 1
+    while True:
+        tail = "" if counter == 1 else f"_{counter}"
+        digest_length = min(12, limit - len(tool_name_prefix()) - len(tail) - 2)
+        if digest_length < 4:
+            raise ValueError("Too many conflicting tool names for the configured name limit")
+        suffix = "_" + digest[:digest_length] + tail
+        candidate = name[:limit - len(suffix)] + suffix
+        if candidate not in registered_names:
+            return candidate
+        counter += 1
+
+
+def request_timeout() -> float:
+    try:
+        timeout = float(os.getenv("FLOWISE_HTTP_TIMEOUT", "30"))
+    except ValueError:
+        raise ValueError("FLOWISE_HTTP_TIMEOUT must be a finite positive number of seconds") from None
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("FLOWISE_HTTP_TIMEOUT must be a finite positive number of seconds")
+    return timeout
+
+
+def validate_filter_patterns() -> tuple[re.Pattern | None, re.Pattern | None]:
+    patterns = []
+    for variable in ("FLOWISE_WHITELIST_NAME_REGEX", "FLOWISE_BLACKLIST_NAME_REGEX"):
+        value = os.getenv(variable, "")
+        try:
+            patterns.append(re.compile(value) if value else None)
+        except re.error:
+            raise ValueError(f"{variable} must be a valid regular expression") from None
+    return patterns[0], patterns[1]
 
 
 def filter_chatflows(chatflows: list[dict]) -> list[dict]:
@@ -140,8 +174,7 @@ def filter_chatflows(chatflows: list[dict]) -> list[dict]:
     # Dynamically fetch filtering criteria
     whitelist_ids = {value.strip() for value in os.getenv("FLOWISE_WHITELIST_ID", "").split(",") if value.strip()}
     blacklist_ids = {value.strip() for value in os.getenv("FLOWISE_BLACKLIST_ID", "").split(",") if value.strip()}
-    whitelist_name_regex = os.getenv("FLOWISE_WHITELIST_NAME_REGEX", "")
-    blacklist_name_regex = os.getenv("FLOWISE_BLACKLIST_NAME_REGEX", "")
+    whitelist_name_regex, blacklist_name_regex = validate_filter_patterns()
 
     filtered_chatflows = []
 
@@ -156,7 +189,7 @@ def filter_chatflows(chatflows: list[dict]) -> list[dict]:
         if whitelist_ids or whitelist_name_regex:
             if whitelist_ids and chatflow_id in whitelist_ids:
                 is_whitelisted = True
-            if whitelist_name_regex and re.search(whitelist_name_regex, chatflow_name):
+            if whitelist_name_regex and whitelist_name_regex.search(chatflow_name):
                 is_whitelisted = True
 
             if is_whitelisted:
@@ -173,7 +206,7 @@ def filter_chatflows(chatflows: list[dict]) -> list[dict]:
             if blacklist_ids and chatflow_id in blacklist_ids:
                 logger.debug("Skipping chatflow '%s' (ID: '%s') - In blacklist.", chatflow_name, chatflow_id)
                 continue  # Exclude blacklisted by ID
-            if blacklist_name_regex and re.search(blacklist_name_regex, chatflow_name):
+            if blacklist_name_regex and blacklist_name_regex.search(chatflow_name):
                 logger.debug("Skipping chatflow '%s' (ID: '%s') - Name matches blacklist regex.", chatflow_name, chatflow_id)
                 continue  # Exclude blacklisted by name
 
@@ -227,7 +260,7 @@ def flowise_predict(chatflow_id: str, question: str) -> str:
 
     try:
         # Send POST request to the Flowise API
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        response = requests.post(url, json=payload, headers=headers, timeout=request_timeout())
         logger.debug(f"Prediction response code: HTTP {response.status_code}")
         response.raise_for_status()
 
@@ -257,18 +290,24 @@ def fetch_chatflows() -> list[dict]:
     if FLOWISE_API_KEY:
         headers["Authorization"] = f"Bearer {FLOWISE_API_KEY}"
 
-    logger.debug(f"Fetching chatflows from {url}")
+    logger.debug("Fetching chatflow inventory")
 
     try:
         # Send GET request to the Flowise API
-        response = requests.get(url, headers=headers, timeout=30)
+        response = requests.get(url, headers=headers, timeout=request_timeout())
         response.raise_for_status()
 
         # Parse and simplify the response data
         chatflows_data = response.json()
+        if not isinstance(chatflows_data, list) or any(
+            not isinstance(cf, dict) or not isinstance(cf.get("id"), str)
+            or not cf["id"] or not isinstance(cf.get("name"), str)
+            for cf in chatflows_data
+        ):
+            raise ValueError("Malformed chatflow inventory")
         simplified_chatflows = [{"id": cf["id"], "name": cf["name"]} for cf in chatflows_data]
 
-        logger.debug(f"Fetched chatflows: {simplified_chatflows}")
+        logger.debug("Fetched %d chatflows", len(simplified_chatflows))
         return filter_chatflows(simplified_chatflows)
     except (requests.RequestException, ValueError, TypeError, KeyError) as e:
         status = e.response.status_code if isinstance(e, requests.RequestException) and e.response is not None else None
@@ -280,7 +319,3 @@ def fetch_chatflows() -> list[dict]:
 # Set up logging before obtaining the logger
 DEBUG = os.getenv("DEBUG", "").lower() in ("true", "1", "yes")
 logger = setup_logging(debug=DEBUG)
-
-# Log key environment variable values
-logger.debug(f"Flowise API Key (redacted): {redact_api_key(FLOWISE_API_KEY)}")
-logger.debug(f"Flowise API Endpoint: {FLOWISE_API_ENDPOINT}")

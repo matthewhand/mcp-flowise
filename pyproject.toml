@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-flowise"
-version = "0.1.1"
+version = "0.1.2"
 requires-python = ">=3.12"
 description = "MCP integration with the Flowise API for discovering chatflows and creating predictions"
 readme = "README.md"
@@ -12,7 +12,7 @@ authors = [
   { name = "Matthew Hand", email = "matthewhandau@gmail.com" }
 ]
 dependencies = [
-  "mcp[cli]>=1.2.0,<2",
+  "mcp[cli]>=1.30.0,<2",
   "python-dotenv>=1.0.1",
   "requests>=2.25.0",
 ]

@@ -2,7 +2,7 @@
 
 [![smithery badge](https://smithery.ai/badge/@matthewhand/mcp-flowise)](https://smithery.ai/server/@matthewhand/mcp-flowise)
 
-`mcp-flowise` exposes Flowise chatflows as Model Context Protocol (MCP) tools over stdio. Clients can discover flows and request non-streaming predictions. Flowise assistants and streaming predictions are not implemented.
+`mcp-flowise` lets MCP-enabled assistants discover and run your Flowise chatflows, with authentication and configurable flow filtering.
 
 It supports two operation modes:
 
@@ -11,7 +11,7 @@ It supports two operation modes:
 
 ## Verification status
 
-Verified on 20 October 2026 against a real Flowise 3.1.3 Docker deployment: stdio initialization, tool discovery, generated answers from protected and unprotected chatflows, filters, and error responses in both modes. The suite includes 25 offline regression checks and four live test executions. See [the verification report](docs/verification-2026-10-20.md) for scope and upstream limitations. This does not certify every saved flow or external tool/provider.
+Core chatflow integration has been verified in both MCP modes. See the [verification report](docs/verification-2026-10-20.md) for the tested version and scope, and the [OpenAPI proxy comparison](docs/codebase-comparison.md) for the follow-up improvements and their verification.
 
 <p align="center">
 <img src="https://github.com/user-attachments/assets/d27afb05-c5d3-4cc9-9918-f7be8c715304" alt="Claude Desktop Screenshot">
@@ -24,7 +24,8 @@ Verified on 20 October 2026 against a real Flowise 3.1.3 Docker deployment: stdi
 - **Dynamic Tool Exposure**: LowLevel mode dynamically creates tools for each visible chatflow. Colliding names receive an ID-derived suffix.
 - **Simpler Configuration**: FastMCP mode exposes `list_chatflows` and `create_prediction` tools for minimal setup.
 - **Flexible Filtering**: Both modes support filtering chatflows via whitelists and blacklists by IDs or names (regex).
-- **MCP Integration**: Integrates seamlessly into MCP workflows.
+- **Client-friendly Tools**: Readable titles and behavior hints distinguish discovery from predictions that may write history or run agent tools.
+- **Responsive Startup**: Dynamic mode discovers flows on first use, so MCP initialization does not wait for Flowise. Failed discovery can be retried by the next request.
 
 ---
 
@@ -139,6 +140,11 @@ If you're using `uvx` on Windows and encounter issues with `--from git+https`, t
 
 - `FLOWISE_API_KEY`: Your Flowise API Bearer token (**required**).
 - `FLOWISE_API_ENDPOINT`: Base URL for Flowise (default: `http://localhost:3000`).
+- `FLOWISE_HTTP_TIMEOUT`: Finite positive HTTP timeout in seconds (default: `30`). Predictions are never automatically retried.
+- `MCP_SERVER_NAME`: Name shown to MCP clients (default: `mcp-flowise`), useful when connecting several instances.
+- `TOOL_NAME_PREFIX`: Optional prefix for tool names in both modes. Letters, digits, underscores and hyphens only.
+- `TOOL_NAME_MAX_LENGTH`: Tool-name length limit, including the prefix (default: `64`, range: `16`–`64`). Leave at least ten characters after the prefix. Changing these settings changes the names clients call.
+- `FLOWISE_LOGFILE_PATH`: Optional rotating log file. Diagnostics otherwise use stderr; no log file is created by default. Files rotate at 5 MiB, retaining two backups.
 
 ### LowLevel Mode (`FLOWISE_SIMPLE_MODE=false`)
 
@@ -217,6 +223,12 @@ uv run pytest tests/integration/test_stdio_live.py -q
 ```
 
 Dynamic tools are a startup snapshot: restart the MCP process after adding, renaming, or changing visibility of flows. Current filters are checked again for each prediction.
+
+## Scope and compatibility
+
+The adapter uses stdio and MCP Python SDK 1.x. It supports non-streaming chatflow predictions. Flowise assistants, streaming predictions and native Streamable HTTP are not implemented. The SDK 2 port in `mcp-openapi-proxy` is a separate migration and has not been copied into this adapter; clients requiring its newer protocol need that migration or a compatible gateway.
+
+Dynamic discovery is cached in memory after a successful fetch, including an empty result. Discovery failures are not cached; the next list/call retries. Predictions recheck visibility against Flowise each time. Flow metadata and authorization are not loaded from a stale disk cache.
 
 ## TODO
 

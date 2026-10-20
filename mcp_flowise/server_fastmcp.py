@@ -9,34 +9,27 @@ import os
 import sys
 import json
 from mcp.server.fastmcp import FastMCP
-from mcp_flowise.utils import flowise_predict, fetch_chatflows, redact_api_key, setup_logging
+from mcp_flowise.utils import flowise_predict, fetch_chatflows, normalize_tool_name, setup_logging
+from mcp_flowise.protocol import PACKAGE_VERSION, advertised_server_name, list_annotations, prediction_annotations
 
 # Environment variables
-FLOWISE_API_KEY = os.getenv("FLOWISE_API_KEY", "")
-FLOWISE_API_ENDPOINT = os.getenv("FLOWISE_API_ENDPOINT", "http://localhost:3000")
 FLOWISE_CHATFLOW_ID = os.getenv("FLOWISE_CHATFLOW_ID")
 FLOWISE_ASSISTANT_ID = os.getenv("FLOWISE_ASSISTANT_ID")
 FLOWISE_CHATFLOW_DESCRIPTION = os.getenv("FLOWISE_CHATFLOW_DESCRIPTION")
-FLOWISE_CHATFLOW_WHITELIST = os.getenv("FLOWISE_CHATFLOW_WHITELIST")
-FLOWISE_CHATFLOW_BLACKLIST = os.getenv("FLOWISE_CHATFLOW_BLACKLIST")
 
 DEBUG = os.getenv("DEBUG", "").lower() in ("true", "1", "yes")
 
 # Configure logging
 logger = setup_logging(debug=DEBUG)
 
-# Log key environment variable values
-logger.debug(f"Flowise API Key (redacted): {redact_api_key(FLOWISE_API_KEY)}")
-logger.debug(f"Flowise API Endpoint: {FLOWISE_API_ENDPOINT}")
-logger.debug(f"Flowise Chatflow ID: {FLOWISE_CHATFLOW_ID}")
-logger.debug(f"Flowise Assistant ID: {FLOWISE_ASSISTANT_ID}")
-logger.debug(f"Flowise Chatflow Description: {FLOWISE_CHATFLOW_DESCRIPTION}")
-
 # Initialize MCP Server
-mcp = FastMCP("FlowiseMCP-with-EnvAuth")
+mcp = FastMCP(advertised_server_name())
+# SDK 1.x FastMCP has no version constructor argument. Keep this compatibility
+# access in one place until a coordinated SDK 2 migration removes it.
+mcp._mcp_server.version = PACKAGE_VERSION
 
 
-@mcp.tool()
+@mcp.tool(name=normalize_tool_name("list_chatflows"), annotations=list_annotations())
 def list_chatflows() -> str:
     """
     List all available chatflows from the Flowise API.
@@ -47,14 +40,16 @@ def list_chatflows() -> str:
     Returns:
         str: A JSON-encoded string of filtered chatflows.
     """
-    logger.debug("Handling list_chatflows tool.")
+    logger.info("mcp rpc method=tools/call name=%s", normalize_tool_name("list_chatflows"))
     chatflows = fetch_chatflows()
 
     logger.debug(f"Filtered chatflows: {chatflows}")
     return json.dumps(chatflows)
 
 
-@mcp.tool()
+@mcp.tool(name=normalize_tool_name("create_prediction"),
+          description=FLOWISE_CHATFLOW_DESCRIPTION or None,
+          annotations=prediction_annotations())
 def create_prediction(*, chatflow_id: str = None, question: str) -> str:
     """
     Create a non-streaming prediction by sending a question to an available chatflow.
@@ -66,6 +61,7 @@ def create_prediction(*, chatflow_id: str = None, question: str) -> str:
     Returns:
         str: The raw JSON response from Flowise API or an error message if something goes wrong.
     """
+    logger.info("mcp rpc method=tools/call name=%s", normalize_tool_name("create_prediction"))
     chatflow_id = chatflow_id or FLOWISE_CHATFLOW_ID
 
     if not chatflow_id and not FLOWISE_ASSISTANT_ID:
