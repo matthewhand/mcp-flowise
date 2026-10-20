@@ -17,15 +17,12 @@ startCommand:
         description: Base URL for Flowise
       flowiseSimpleMode:
         type: boolean
-        default: false
+        default: true
         description: Enable FastMCP mode for simpler configuration
       flowiseChatflowId:
         type: string
         description: Single Chatflow ID for FastMCP mode (optional)
-      flowiseAssistantId:
-        type: string
-        description: Single Assistant ID for FastMCP mode (optional)
   commandFunction:
     # A function that produces the CLI command to start the MCP on stdio.
     |-
-    (config) => ({command: 'uvx', args: ['--from', 'git+https://github.com/matthewhand/mcp-flowise', 'mcp-flowise'], env: {FLOWISE_API_KEY: config.flowiseApiKey, FLOWISE_API_ENDPOINT: config.flowiseApiEndpoint || 'http://localhost:3000', FLOWISE_SIMPLE_MODE: config.flowiseSimpleMode ? 'true' : 'false', FLOWISE_CHATFLOW_ID: config.flowiseChatflowId || '', FLOWISE_ASSISTANT_ID: config.flowiseAssistantId || ''}})
+    (config) => ({command: 'mcp-flowise', args: [], env: {FLOWISE_API_KEY: config.flowiseApiKey, FLOWISE_API_ENDPOINT: config.flowiseApiEndpoint || 'http://localhost:3000', FLOWISE_SIMPLE_MODE: config.flowiseSimpleMode === false ? 'false' : 'true', FLOWISE_CHATFLOW_ID: config.flowiseChatflowId || ''}})

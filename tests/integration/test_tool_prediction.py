@@ -2,6 +2,10 @@ import unittest
 import os
 from mcp_flowise.utils import flowise_predict
 
+@unittest.skipUnless(
+    os.getenv("FLOWISE_LIVE_TESTS") == "1" and os.getenv("FLOWISE_TEST_CHATFLOW_ID"),
+    "Live checks require explicit opt-in and a harmless FLOWISE_TEST_CHATFLOW_ID",
+)
 class TestToolPrediction(unittest.TestCase):
     """
     Integration test for predicting results from a Flowise chatflow.
@@ -11,10 +15,7 @@ class TestToolPrediction(unittest.TestCase):
         """
         Test the prediction function for a Flowise chatflow.
         """
-        # Check if FLOWISE_CHATFLOW_ID is set
-        chatflow_id = os.getenv("FLOWISE_CHATFLOW_ID")
-        if not chatflow_id:
-            self.skipTest("FLOWISE_CHATFLOW_ID environment variable is not set.")
+        chatflow_id = os.environ["FLOWISE_TEST_CHATFLOW_ID"]
         
         question = "What is the weather like today?"
         print(f"Using chatflow_id: {chatflow_id}")
