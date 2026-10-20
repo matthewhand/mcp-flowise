@@ -47,7 +47,7 @@ A real MCP client connected through `docker run --rm -i` to version 0.1.2.
 Both simple and dynamic modes discovered the live catalog and returned
 nonempty model text from the selected protected and unprotected chatflows
 (four predictions). The offline suite passes **46 checks**, with **five
-explicitly opt-in live checks skipped**. CI covers Python 3.12 and 3.13.
+explicitly opt-in live checks skipped**. At that stage CI covered Python 3.12 and 3.13.
 Obsolete import-time scripts and a test that only asserted its own mock
 response were removed. Legacy HTTP checks now require explicit live-test
 opt-in and a selected harmless flow; they never choose an arbitrary flow.
@@ -57,6 +57,19 @@ The older runtime draft and incompatible `dev` experiment are retained in
 runtime behavior comes from the verified 0.1.2 changes; the remaining draft
 packaging work was reconciled separately. Repository Docker support does
 not imply that a third-party directory account has been claimed or configured.
+
+## Python 3.14 follow-up (0.1.3)
+
+Version 0.1.3 raises the minimum Python version to **3.13**, replaces 3.12
+with **3.14** in CI, and builds the Docker image on **Python 3.14**. The
+lock file was regenerated with uv 0.13.3 without upgrading dependency
+versions. Earlier 3.12 results above describe the historical baseline.
+
+Windows Python **3.14.4** passed **46 checks, five opt-in skips**. The Docker
+Desktop image built successfully on **3.14.8** and passed actual MCP stdio
+discovery and protected/unprotected prediction in both modes (four live
+predictions). Some pinned third-party dependencies emit Python 3.14 syntax
+warnings on first import; they did not fail these checks.
 
 ## Limits and concerns
 
