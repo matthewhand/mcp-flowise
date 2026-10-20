@@ -14,7 +14,7 @@ import pytest
 
 @pytest.mark.parametrize('simple', [True, False], ids=['simple', 'dynamic'])
 def test_stdio_success_and_upstream_errors(simple, tmp_path):
-    state = {'get_status': 200, 'post_status': 200}
+    state = {'get_status': 200, 'post_status': 200, 'get_calls': 0}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -27,6 +27,7 @@ def test_stdio_success_and_upstream_errors(simple, tmp_path):
             self.wfile.write(json.dumps(value).encode())
 
         def do_GET(self):
+            state['get_calls'] += 1
             self.reply(state['get_status'], [{'id': 'fixture-flow', 'name': 'Fixture Flow'}])
 
         def do_POST(self):
@@ -41,14 +42,23 @@ def test_stdio_success_and_upstream_errors(simple, tmp_path):
         env = {k: v for k, v in os.environ.items() if not k.startswith('FLOWISE_')}
         env.update(FLOWISE_API_ENDPOINT=f'http://127.0.0.1:{server.server_port}',
                    FLOWISE_API_KEY='fixture-only', FLOWISE_SIMPLE_MODE=str(simple).lower(),
-                   FLOWISE_LOGFILE_PATH=str(tmp_path / 'adapter.log'))
+                   FLOWISE_LOGFILE_PATH=str(tmp_path / 'adapter.log'),
+                   MCP_SERVER_NAME='fixture-flowise', TOOL_NAME_PREFIX='', TOOL_NAME_MAX_LENGTH='64')
         params = StdioServerParameters(command=sys.executable, args=['-m', 'mcp_flowise'],
                                        cwd=str(Path(__file__).resolve().parents[2]), env=env)
         async with stdio_client(params) as (reader, writer):
             async with ClientSession(reader, writer) as session:
                 initialized = await session.initialize()
                 assert initialized.capabilities.tools is not None
+                assert initialized.serverInfo.name == 'fixture-flowise'
+                assert state['get_calls'] == 0, 'MCP initialization must not contact Flowise'
                 tools = (await session.list_tools()).tools
+                if simple:
+                    annotations = {tool.name: tool.annotations for tool in tools}
+                    assert annotations['list_chatflows'].readOnlyHint
+                    assert annotations['create_prediction'].readOnlyHint is False
+                else:
+                    assert tools[0].annotations.readOnlyHint is False
                 name = 'create_prediction' if simple else 'fixture_flow'
                 args = {'question': 'hello'}
                 if simple:

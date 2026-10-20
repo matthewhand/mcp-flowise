@@ -1,5 +1,7 @@
 # Verification — 20 October 2026
 
+Verified source: **mcp-flowise 0.1.1**, code commit `3a1a17a` (documentation updated in `1e46419`). The proposed 0.1.2 comparison patch is not covered by these results; see [its review status](codebase-comparison.md#review-and-verification-status).
+
 ## Environment and scope
 
 - Windows MCP client process, Python 3.13.2, MCP Python SDK 1.30.0. The 25 offline checks also pass on the documented minimum Python 3.12.9.

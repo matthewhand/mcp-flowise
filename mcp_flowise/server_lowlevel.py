@@ -8,8 +8,7 @@ and consistency, and potential conflicts are logged.
 Descriptions for tools are prioritized from FLOWISE_CHATFLOW_DESCRIPTIONS,
 falling back to the chatflow names when not provided.
 
-Conflicts in tool names after normalization are handled gracefully by
-skipping those chatflows.
+Conflicting names remain callable through ID-derived suffixes.
 '''
 
 import os
@@ -22,11 +21,15 @@ from mcp.server.lowlevel import Server
 from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 from mcp_flowise.utils import (
+    FlowiseAPIError,
     flowise_predict,
     fetch_chatflows,
     normalize_tool_name,
     setup_logging,
+    tool_name_prefix,
+    unique_tool_name,
 )
+from mcp_flowise.protocol import PACKAGE_VERSION, advertised_server_name, prediction_annotations
 
 # Configure logging
 DEBUG = os.getenv("DEBUG", "").lower() in ("true", "1", "yes")
@@ -37,7 +40,23 @@ NAME_TO_ID_MAPPING: Dict[str, str] = {}
 tools: List[types.Tool] = []
 
 # Initialize the Low-Level MCP Server
-mcp = Server("FlowiseMCP-with-EnvAuth")
+mcp = Server(advertised_server_name(), version=PACKAGE_VERSION)
+_tools_loaded = False
+_tools_load_lock: asyncio.Lock | None = None
+
+
+async def ensure_tools_loaded() -> None:
+    """Delay Flowise I/O until discovery or a call; retry failed discovery on next request."""
+    global _tools_load_lock
+    if _tools_loaded:
+        return
+    if _tools_load_lock is None:
+        _tools_load_lock = asyncio.Lock()
+    async with _tools_load_lock:
+        if _tools_loaded:
+            return
+        chatflows = await asyncio.to_thread(fetch_chatflows)
+        register_tools(chatflows, get_chatflow_descriptions())
 
 
 def get_chatflow_descriptions() -> Dict[str, str]:
@@ -52,16 +71,15 @@ def get_chatflow_descriptions() -> Dict[str, str]:
         logger.debug("No FLOWISE_CHATFLOW_DESCRIPTIONS provided.")
         return {}
 
-    logger.debug("Retrieved FLOWISE_CHATFLOW_DESCRIPTIONS: %s", descriptions_env)
     descriptions = {}
     for pair in descriptions_env.split(","):
         if ":" not in pair:
-            logger.warning("Invalid format in FLOWISE_CHATFLOW_DESCRIPTIONS: %s", pair)
+            logger.warning("Ignoring a malformed FLOWISE_CHATFLOW_DESCRIPTIONS entry")
             continue
         chatflow_id, description = map(str.strip, pair.split(":", 1))
         if chatflow_id and description:
             descriptions[chatflow_id] = description
-    logger.debug("Parsed FLOWISE_CHATFLOW_DESCRIPTIONS: %s", descriptions)
+    logger.debug("Loaded %d custom chatflow descriptions", len(descriptions))
     return descriptions
 
 
@@ -71,10 +89,10 @@ async def dispatcher_handler(request: types.CallToolRequest) -> types.ServerResu
     """
     try:
         tool_name = request.params.name
-        logger.debug("Dispatcher received CallToolRequest for tool: %s", tool_name)
+        await ensure_tools_loaded()
 
         if tool_name not in NAME_TO_ID_MAPPING:
-            logger.error("Unknown tool requested: %s", tool_name)
+            logger.error("Unknown tool requested")
             return types.ServerResult(
                 root=types.CallToolResult(
                     content=[types.TextContent(type="text", text="Unknown tool requested")], isError=True
@@ -82,7 +100,12 @@ async def dispatcher_handler(request: types.CallToolRequest) -> types.ServerResu
             )
 
         chatflow_id = NAME_TO_ID_MAPPING[tool_name]
-        question = (request.params.arguments or {}).get("question", "")
+        logger.info("mcp rpc method=tools/call name=%s", tool_name)
+        arguments = request.params.arguments or {}
+        if set(arguments) - {"question"}:
+            return types.ServerResult(root=types.CallToolResult(
+                content=[types.TextContent(type="text", text="Only the 'question' argument is supported")], isError=True))
+        question = arguments.get("question", "")
         if not isinstance(question, str) or not question.strip():
             logger.error("Missing 'question' argument for tool: %s", tool_name)
             return types.ServerResult(
@@ -96,7 +119,7 @@ async def dispatcher_handler(request: types.CallToolRequest) -> types.ServerResu
         # Call the prediction function
         try:
             result = await asyncio.to_thread(flowise_predict, chatflow_id, question)
-        except Exception as pred_err:
+        except (FlowiseAPIError, ValueError) as pred_err:
             logger.error("Error during prediction: %s", type(pred_err).__name__)
             return types.ServerResult(root=types.CallToolResult(
                 content=[types.TextContent(type="text", text=str(pred_err))], isError=True))
@@ -107,8 +130,11 @@ async def dispatcher_handler(request: types.CallToolRequest) -> types.ServerResu
                 content=[types.TextContent(type="text", text=result)]
             )
         )
-    except Exception as e:
-        logger.error("Unhandled exception in dispatcher_handler: %s", e, exc_info=True)
+    except FlowiseAPIError as e:
+        return types.ServerResult(root=types.CallToolResult(
+            content=[types.TextContent(type="text", text=str(e))], isError=True))
+    except Exception:
+        logger.error("Unexpected prediction failure")
         return types.ServerResult(
             root=types.CallToolResult(
                 content=[types.TextContent(type="text", text=json.dumps({"error": "Internal server error."}))], isError=True
@@ -126,7 +152,8 @@ async def list_tools(request: types.ListToolsRequest) -> types.ServerResult:
     Returns:
         types.ServerResult: The result containing the list of tools.
     """
-    logger.debug("Handling list_tools request.")
+    logger.info("mcp rpc method=tools/list")
+    await ensure_tools_loaded()
     return types.ServerResult(root=types.ListToolsResult(tools=tools))
 
 
@@ -141,19 +168,18 @@ def register_tools(chatflows: List[Dict[str, Any]], chatflow_descriptions: Dict[
     Returns:
         List[types.Tool]: List of registered tools.
     """
-    global tools
-    tools = []  # Clear existing tools before re-registration
-    NAME_TO_ID_MAPPING.clear()
-    for chatflow in chatflows:
+    global tools, _tools_loaded
+    tool_name_prefix()  # Validate configuration before changing any registration.
+    new_tools = []
+    new_mapping = {}
+    registered_ids = set()
+    # Stable ordering makes collision names independent of API result order.
+    for chatflow in sorted(chatflows, key=lambda flow: flow["id"]):
         try:
+            if chatflow["id"] in registered_ids:
+                continue
             normalized_name = normalize_tool_name(chatflow["name"])
-
-            if normalized_name in NAME_TO_ID_MAPPING:
-                import hashlib
-                suffix = hashlib.sha256(chatflow["id"].encode()).hexdigest()[:12]
-                normalized_name = normalized_name[:51] + "_" + suffix
-
-            NAME_TO_ID_MAPPING[normalized_name] = chatflow["id"]
+            normalized_name = unique_tool_name(normalized_name, chatflow["id"], set(new_mapping))
             description = chatflow_descriptions.get(chatflow["id"], chatflow["name"])
 
             tool = types.Tool(
@@ -162,15 +188,22 @@ def register_tools(chatflows: List[Dict[str, Any]], chatflow_descriptions: Dict[
                 inputSchema={
                     "type": "object",
                     "required": ["question"],
-                    "properties": {"question": {"type": "string"}},
+                    "properties": {"question": {"type": "string", "minLength": 1}},
+                    "additionalProperties": False,
                 },
+                annotations=prediction_annotations(chatflow["name"]),
             )
-            tools.append(tool)
+            new_tools.append(tool)
+            new_mapping[normalized_name] = chatflow["id"]
+            registered_ids.add(chatflow["id"])
             logger.debug("Registered tool: %s (ID: %s)", tool.name, chatflow["id"])
 
-        except Exception as e:
-            logger.error("Error registering chatflow '%s' (ID: '%s'): %s", chatflow["name"], chatflow["id"], e)
-
+        except (TypeError, KeyError):
+            logger.error("Skipping malformed chatflow metadata")
+    tools = new_tools
+    NAME_TO_ID_MAPPING.clear()
+    NAME_TO_ID_MAPPING.update(new_mapping)
+    _tools_loaded = True
     return tools
 
 
@@ -185,8 +218,8 @@ async def start_server():
                 read_stream,
                 write_stream,
                 initialization_options=InitializationOptions(
-                    server_name="FlowiseMCP-with-EnvAuth",
-                    server_version="0.1.1",
+                    server_name=advertised_server_name(),
+                    server_version=PACKAGE_VERSION,
                     capabilities=types.ServerCapabilities(tools=types.ToolsCapability(listChanged=False)),
                 ),
             )
@@ -199,20 +232,7 @@ def run_server():
     """
     Run the Low-Level Flowise server by registering tools dynamically.
     """
-    try:
-        chatflows = fetch_chatflows()
-        if not chatflows:
-            raise ValueError("No chatflows retrieved from the Flowise API.")
-    except Exception as e:
-        logger.critical("Failed to start server: %s", e)
-        sys.exit(1)
-
-    chatflow_descriptions = get_chatflow_descriptions()
-    register_tools(chatflows, chatflow_descriptions)
-
-    if not tools:
-        logger.critical("No valid tools registered. Shutting down the server.")
-        sys.exit(1)
+    # No network request here: initialize must not depend on Flowise availability.
 
     mcp.request_handlers[types.CallToolRequest] = dispatcher_handler
     logger.debug("Registered dispatcher_handler for CallToolRequest.")
