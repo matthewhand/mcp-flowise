@@ -2,8 +2,14 @@ import unittest
 from unittest.mock import patch, Mock
 import requests
 from mcp_flowise.utils import flowise_predict, fetch_chatflows, filter_chatflows, normalize_tool_name
+from mcp_flowise.utils import FlowiseAPIError
 
 class TestUtils(unittest.TestCase):
+
+    def setUp(self):
+        self.discovery = patch('mcp_flowise.utils.fetch_chatflows', return_value=[{'id': 'valid_chatflow_id', 'name': 'Test'}])
+        self.discovery.start()
+        self.addCleanup(self.discovery.stop)
 
     @patch("requests.post")
     def test_flowise_predict_success(self, mock_post: Mock) -> None:
@@ -23,8 +29,8 @@ class TestUtils(unittest.TestCase):
         """
         Test prediction handling of timeout.
         """
-        response = flowise_predict("valid_chatflow_id", "What's AI?")
-        self.assertIn("error", response)  # Assert the response contains the error key
+        with self.assertRaises(FlowiseAPIError):
+            flowise_predict("valid_chatflow_id", "What's AI?")
         # self.assertIn("Timeout", response)  # Timeout-specific assertion
 
     @patch("requests.post")
@@ -37,9 +43,8 @@ class TestUtils(unittest.TestCase):
             raise_for_status=Mock(side_effect=requests.HTTPError("500 Error")),
             text='{"error": "500 Error"}',
         )
-        response = flowise_predict("valid_chatflow_id", "What's AI?")
-        self.assertIn("error", response)
-        self.assertIn("500 Error", response)
+        with self.assertRaises(FlowiseAPIError):
+            flowise_predict("valid_chatflow_id", "What's AI?")
 
     @patch("requests.get")
     def test_fetch_chatflows_success(self, mock_get: Mock) -> None:
@@ -61,8 +66,8 @@ class TestUtils(unittest.TestCase):
         """
         Test handling of timeout when fetching chatflows.
         """
-        chatflows = fetch_chatflows()
-        self.assertEqual(chatflows, [])  # Should return an empty list on timeout
+        with self.assertRaises(FlowiseAPIError):
+            fetch_chatflows()
 
     @patch("requests.get")
     def test_fetch_chatflows_http_error(self, mock_get: Mock) -> None:
@@ -73,8 +78,8 @@ class TestUtils(unittest.TestCase):
             status_code=500,
             raise_for_status=Mock(side_effect=requests.HTTPError("500 Error")),
         )
-        chatflows = fetch_chatflows()
-        self.assertEqual(chatflows, [])  # Should return an empty list on HTTP error
+        with self.assertRaises(FlowiseAPIError):
+            fetch_chatflows()
 
     def test_filter_chatflows(self) -> None:
         """

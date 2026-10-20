@@ -50,18 +50,6 @@ def list_chatflows() -> str:
     logger.debug("Handling list_chatflows tool.")
     chatflows = fetch_chatflows()
 
-    # Apply whitelisting
-    if FLOWISE_CHATFLOW_WHITELIST:
-        whitelist = set(FLOWISE_CHATFLOW_WHITELIST.split(","))
-        chatflows = [cf for cf in chatflows if cf["id"] in whitelist]
-        logger.debug(f"Applied whitelist filter: {whitelist}")
-
-    # Apply blacklisting
-    if FLOWISE_CHATFLOW_BLACKLIST:
-        blacklist = set(FLOWISE_CHATFLOW_BLACKLIST.split(","))
-        chatflows = [cf for cf in chatflows if cf["id"] not in blacklist]
-        logger.debug(f"Applied blacklist filter: {blacklist}")
-
     logger.debug(f"Filtered chatflows: {chatflows}")
     return json.dumps(chatflows)
 
@@ -69,7 +57,7 @@ def list_chatflows() -> str:
 @mcp.tool()
 def create_prediction(*, chatflow_id: str = None, question: str) -> str:
     """
-    Create a prediction by sending a question to a specific chatflow or assistant.
+    Create a non-streaming prediction by sending a question to an available chatflow.
 
     Args:
         chatflow_id (str, optional): The ID of the chatflow to use. Defaults to FLOWISE_CHATFLOW_ID.
@@ -78,24 +66,15 @@ def create_prediction(*, chatflow_id: str = None, question: str) -> str:
     Returns:
         str: The raw JSON response from Flowise API or an error message if something goes wrong.
     """
-    logger.debug(f"create_prediction called with chatflow_id={chatflow_id}, question={question}")
     chatflow_id = chatflow_id or FLOWISE_CHATFLOW_ID
 
     if not chatflow_id and not FLOWISE_ASSISTANT_ID:
         logger.error("No chatflow_id or assistant_id provided or pre-configured.")
-        return json.dumps({"error": "chatflow_id or assistant_id is required"})
+        raise ValueError("chatflow_id is required")
 
-    try:
-        # Determine which chatflow ID to use
-        target_chatflow_id = chatflow_id or FLOWISE_ASSISTANT_ID
-
-        # Call the prediction function and return the raw JSON result
-        result = flowise_predict(target_chatflow_id, question)
-        logger.debug(f"Prediction result: {result}")
-        return result  # Returning raw JSON as a string
-    except Exception as e:
-        logger.error(f"Unhandled exception in create_prediction: {e}", exc_info=True)
-        return json.dumps({"error": str(e)})
+    if not chatflow_id:
+        raise ValueError("FLOWISE_ASSISTANT_ID is unsupported; configure a chatflow ID")
+    return flowise_predict(chatflow_id, question)
 
 def run_simple_server():
     """

@@ -31,9 +31,6 @@ def main():
 
     logger.debug("Starting mcp_flowise package entry point.")
 
-    chatflows = fetch_chatflows()
-    logger.debug(f"Available chatflows: {chatflows}")
-
     # Default to Simple Mode unless explicitly disabled
     FLOWISE_SIMPLE_MODE = os.getenv("FLOWISE_SIMPLE_MODE", "true").lower() not in ("false", "0", "no")
     if FLOWISE_SIMPLE_MODE:

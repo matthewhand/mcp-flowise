@@ -2,12 +2,16 @@
 
 [![smithery badge](https://smithery.ai/badge/@matthewhand/mcp-flowise)](https://smithery.ai/server/@matthewhand/mcp-flowise)
 
-`mcp-flowise` is a Python package implementing a Model Context Protocol (MCP) server that integrates with the Flowise API. It provides a standardized and flexible way to list chatflows, create predictions, and dynamically register tools for Flowise chatflows or assistants.
+`mcp-flowise` exposes Flowise chatflows as Model Context Protocol (MCP) tools over stdio. Clients can discover flows and request non-streaming predictions. Flowise assistants and streaming predictions are not implemented.
 
 It supports two operation modes:
 
-- **LowLevel Mode (Default)**: Dynamically registers tools for all chatflows retrieved from the Flowise API.
-- **FastMCP Mode**: Provides static tools for listing chatflows and creating predictions, suitable for simpler configurations.
+- **FastMCP Mode (default)**: Provides `list_chatflows` and `create_prediction` tools.
+- **LowLevel Mode** (`FLOWISE_SIMPLE_MODE=false`): Dynamically registers a tool for each visible chatflow.
+
+## Verification status
+
+Verified on 20 October 2026 against a real Flowise 3.1.3 Docker deployment: stdio initialization, tool discovery, generated answers from protected and unprotected chatflows, filters, and error responses in both modes. The suite includes 25 offline regression checks and four live test executions. See [the verification report](docs/verification-2026-10-20.md) for scope and upstream limitations. This does not certify every saved flow or external tool/provider.
 
 <p align="center">
 <img src="https://github.com/user-attachments/assets/d27afb05-c5d3-4cc9-9918-f7be8c715304" alt="Claude Desktop Screenshot">
@@ -17,7 +21,7 @@ It supports two operation modes:
 
 ## Features
 
-- **Dynamic Tool Exposure**: LowLevel mode dynamically creates tools for each chatflow or assistant.
+- **Dynamic Tool Exposure**: LowLevel mode dynamically creates tools for each visible chatflow. Colliding names receive an ID-derived suffix.
 - **Simpler Configuration**: FastMCP mode exposes `list_chatflows` and `create_prediction` tools for minimal setup.
 - **Flexible Filtering**: Both modes support filtering chatflows via whitelists and blacklists by IDs or names (regex).
 - **MCP Integration**: Integrates seamlessly into MCP workflows.
@@ -78,7 +82,7 @@ You can integrate `mcp-flowise` into your MCP ecosystem by adding it to the `mcp
 
 Enabled by setting `FLOWISE_SIMPLE_MODE=true`. This mode:
 - Exposes two tools: `list_chatflows` and `create_prediction`.
-- Allows static configuration using `FLOWISE_CHATFLOW_ID` or `FLOWISE_ASSISTANT_ID`.
+- Allows a default flow using `FLOWISE_CHATFLOW_ID`, or an explicit `chatflow_id` on each call.
 - Lists all available chatflows via `list_chatflows`.
 
 <p align="center">
@@ -136,7 +140,7 @@ If you're using `uvx` on Windows and encounter issues with `--from git+https`, t
 - `FLOWISE_API_KEY`: Your Flowise API Bearer token (**required**).
 - `FLOWISE_API_ENDPOINT`: Base URL for Flowise (default: `http://localhost:3000`).
 
-### LowLevel Mode (Default)
+### LowLevel Mode (`FLOWISE_SIMPLE_MODE=false`)
 
 - `FLOWISE_CHATFLOW_DESCRIPTIONS`: Comma-separated list of `chatflow_id:description` pairs. Example:
   ```
@@ -146,8 +150,7 @@ If you're using `uvx` on Windows and encounter issues with `--from git+https`, t
 ### FastMCP Mode (`FLOWISE_SIMPLE_MODE=true`)
 
 - `FLOWISE_CHATFLOW_ID`: Single Chatflow ID (optional).
-- `FLOWISE_ASSISTANT_ID`: Single Assistant ID (optional).
-- `FLOWISE_CHATFLOW_DESCRIPTION`: Optional description for the single tool exposed.
+- `FLOWISE_ASSISTANT_ID`: Unsupported legacy setting; use a chatflow ID.
 
 ---
 
@@ -164,13 +167,15 @@ Filters can be applied in both modes using the following environment variables:
 - **Blacklist by Name (Regex)**:  
   `FLOWISE_BLACKLIST_NAME_REGEX=".*deprecated.*"`
 
-> **Note**: Whitelists take precedence over blacklists. If both are set, the most restrictive rule is applied.
+Whitelist IDs and name patterns are combined with OR. If either whitelist is configured, matching flows are included and the primary blacklist is ignored (existing behavior). Without a whitelist, either blacklist excludes a flow. Comma-separated IDs are trimmed. Legacy `FLOWISE_CHATFLOW_WHITELIST` and `FLOWISE_CHATFLOW_BLACKLIST` are additional restrictions in both modes. The same filters are enforced during prediction, including explicit IDs.
 
 -
 ## Security
 
 - **Protect Your API Key**: Ensure the `FLOWISE_API_KEY` is kept secure and not exposed in logs or repositories.
 - **Environment Configuration**: Use `.env` files or environment variables for sensitive configurations.
+- **API permissions**: Flowise 3 API keys need permission to view chatflows, plus access to protected prediction flows. A UI login password is not an API key. Keep the service on a trusted network.
+- **Protocol and errors**: Diagnostic logs use stderr or the configured log file. Authentication, HTTP failures, and invalid calls produce MCP tool errors instead of successful-looking responses. Prompts and generated answers are not written to adapter logs.
 
 Add `.env` to your `.gitignore`:
 
@@ -192,6 +197,26 @@ Add `.env` to your `.gitignore`:
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
+## Development checks
+
+```bash
+uv sync --frozen --group dev
+uv run pytest tests/unit tests/integration/test_stdio_protocol.py -q
+```
+
+The protocol tests launch real MCP subprocesses against a local HTTP fixture. Live tests are explicitly opt-in and make real model requests:
+
+```bash
+# Supply a key and choose a harmless flow on your own Flowise instance.
+export FLOWISE_LIVE_TESTS=1
+export FLOWISE_API_ENDPOINT=http://localhost:3030
+export FLOWISE_API_KEY=your_private_key
+export FLOWISE_TEST_CHATFLOW_ID=your_chatflow_id
+uv run pytest tests/integration/test_stdio_live.py -q
+```
+
+Dynamic tools are a startup snapshot: restart the MCP process after adding, renaming, or changing visibility of flows. Current filters are checked again for each prediction.
 
 ## TODO
 

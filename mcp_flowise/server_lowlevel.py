@@ -77,29 +77,29 @@ async def dispatcher_handler(request: types.CallToolRequest) -> types.ServerResu
             logger.error("Unknown tool requested: %s", tool_name)
             return types.ServerResult(
                 root=types.CallToolResult(
-                    content=[types.TextContent(type="text", text="Unknown tool requested")]
+                    content=[types.TextContent(type="text", text="Unknown tool requested")], isError=True
                 )
             )
 
         chatflow_id = NAME_TO_ID_MAPPING[tool_name]
-        question = request.params.arguments.get("question", "")
-        if not question:
+        question = (request.params.arguments or {}).get("question", "")
+        if not isinstance(question, str) or not question.strip():
             logger.error("Missing 'question' argument for tool: %s", tool_name)
             return types.ServerResult(
                 root=types.CallToolResult(
-                    content=[types.TextContent(type="text", text="Missing 'question' argument.")]
+                    content=[types.TextContent(type="text", text="A non-empty 'question' argument is required.")], isError=True
                 )
             )
 
-        logger.debug("Dispatching prediction for chatflow_id: %s with question: %s", chatflow_id, question)
+        logger.debug("Dispatching prediction for chatflow_id: %s", chatflow_id)
 
         # Call the prediction function
         try:
-            result = flowise_predict(chatflow_id, question)
-            logger.debug("Prediction result: %s", result)
+            result = await asyncio.to_thread(flowise_predict, chatflow_id, question)
         except Exception as pred_err:
-            logger.error("Error during prediction: %s", pred_err, exc_info=True)
-            result = json.dumps({"error": "Error occurred during prediction."})
+            logger.error("Error during prediction: %s", type(pred_err).__name__)
+            return types.ServerResult(root=types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(pred_err))], isError=True))
 
         # Pass the raw JSON response or error JSON back to the client
         return types.ServerResult(
@@ -111,7 +111,7 @@ async def dispatcher_handler(request: types.CallToolRequest) -> types.ServerResu
         logger.error("Unhandled exception in dispatcher_handler: %s", e, exc_info=True)
         return types.ServerResult(
             root=types.CallToolResult(
-                content=[types.TextContent(type="text", text=json.dumps({"error": "Internal server error."}))]  # Ensure JSON is returned
+                content=[types.TextContent(type="text", text=json.dumps({"error": "Internal server error."}))], isError=True
             )
         )
 
@@ -143,18 +143,15 @@ def register_tools(chatflows: List[Dict[str, Any]], chatflow_descriptions: Dict[
     """
     global tools
     tools = []  # Clear existing tools before re-registration
+    NAME_TO_ID_MAPPING.clear()
     for chatflow in chatflows:
         try:
             normalized_name = normalize_tool_name(chatflow["name"])
 
             if normalized_name in NAME_TO_ID_MAPPING:
-                logger.warning(
-                    "Tool name conflict: '%s' already exists. Skipping chatflow '%s' (ID: '%s').",
-                    normalized_name,
-                    chatflow["name"],
-                    chatflow["id"],
-                )
-                continue
+                import hashlib
+                suffix = hashlib.sha256(chatflow["id"].encode()).hexdigest()[:12]
+                normalized_name = normalized_name[:51] + "_" + suffix
 
             NAME_TO_ID_MAPPING[normalized_name] = chatflow["id"]
             description = chatflow_descriptions.get(chatflow["id"], chatflow["name"])
@@ -189,8 +186,8 @@ async def start_server():
                 write_stream,
                 initialization_options=InitializationOptions(
                     server_name="FlowiseMCP-with-EnvAuth",
-                    server_version="0.1.0",
-                    capabilities=types.ServerCapabilities(),
+                    server_version="0.1.1",
+                    capabilities=types.ServerCapabilities(tools=types.ToolsCapability(listChanged=False)),
                 ),
             )
     except Exception as e:
