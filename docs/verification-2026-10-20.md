@@ -3,6 +3,7 @@
 ## Environment and scope
 
 - Windows MCP client process, Python 3.13.2, MCP Python SDK 1.30.0. The 25 offline checks also pass on the documented minimum Python 3.12.9.
+- The installed Linux adapter also passed all 25 offline checks on Python 3.12.8. A Windows client connected to it using stdio over SSH: two static tools in simple mode, 18 tools in dynamic mode, and nonempty predictions from both selected flows in each mode.
 - Real Linux Flowise Docker service upgraded from 2.2.2 to **3.1.3**.
 - Official image pinned to `flowiseai/flowise:3.1.3@sha256:fa39f54c82ebecabb817cbd2d01fc9fa7bb26d58a7e818c36bb6c2bad44b366a`.
 - The staged upgrade used a protected copy before the live deployment was switched.
