@@ -8,6 +8,10 @@ import unittest
 from mcp_flowise.utils import fetch_chatflows, flowise_predict
 
 
+@unittest.skipUnless(
+    os.getenv("FLOWISE_LIVE_TESTS") == "1" and os.getenv("FLOWISE_TEST_CHATFLOW_ID"),
+    "Live checks require explicit opt-in and a harmless FLOWISE_TEST_CHATFLOW_ID",
+)
 class IntegrationTests(unittest.TestCase):
     """
     Integration tests for Flowise MCP.
@@ -37,16 +41,10 @@ class IntegrationTests(unittest.TestCase):
         if not chatflows:
             self.skipTest("No chatflows discovered on the server. Skipping tool test.")
 
-        # Handle cases with and without the FLOWISE_CHATFLOW_ID environment variable
-        specific_chatflow_id = os.getenv("FLOWISE_CHATFLOW_ID")
-        if specific_chatflow_id:
-            # Look for the specified chatflow ID
-            chatflow = next((cf for cf in chatflows if cf["id"] == specific_chatflow_id), None)
-            if not chatflow:
-                self.skipTest(f"Specified chatflow ID {specific_chatflow_id} not found. Skipping tool test.")
-        else:
-            # Fallback to the first chatflow if no ID is specified
-            chatflow = chatflows[0]
+        # Exercise only the explicitly selected harmless flow.
+        specific_chatflow_id = os.environ["FLOWISE_TEST_CHATFLOW_ID"]
+        chatflow = next((cf for cf in chatflows if cf["id"] == specific_chatflow_id), None)
+        self.assertIsNotNone(chatflow, "Selected test chatflow was not discovered.")
 
         tool_name = chatflow.get("name")
         print(f"Testing tool: {tool_name} with ID: {chatflow['id']}")

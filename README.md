@@ -1,8 +1,7 @@
-[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/matthewhand-mcp-flowise-badge.png)](https://mseep.ai/app/matthewhand-mcp-flowise)
-
 # mcp-flowise
 
 [![smithery badge](https://smithery.ai/badge/@matthewhand/mcp-flowise)](https://smithery.ai/server/@matthewhand/mcp-flowise)
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/matthewhand-mcp-flowise-badge.png)](https://mseep.ai/app/matthewhand-mcp-flowise)
 
 `mcp-flowise` lets MCP-enabled assistants discover and run your Flowise chatflows, with authentication and configurable flow filtering.
 
@@ -45,6 +44,22 @@ npx -y @smithery/cli install @matthewhand/mcp-flowise --client claude
 
 - Python 3.12 or higher
 - `uvx` package manager
+
+### Docker
+
+```bash
+docker build -t mcp-flowise:local .
+docker run --rm -i --env-file .env mcp-flowise:local
+```
+
+The image installs the copied checkout from `uv.lock` and runs as a non-root
+user. No Git download occurs at startup. Supply credentials at runtime;
+`.env` files are excluded from the build context. This is stdio MCP, so use
+`-i` and do not publish a port. Inside Docker, `localhost` is the container:
+set `FLOWISE_API_ENDPOINT` to a reachable Flowise address (for a host service
+in Docker Desktop, use `host.docker.internal` with its actual service port).
+Directory listings such as Glama may require separate account-side setup;
+providing a repository Dockerfile does not configure those accounts.
 
 ### Install and Run via `uvx`
 

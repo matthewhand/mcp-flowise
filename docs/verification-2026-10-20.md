@@ -35,6 +35,29 @@ Two deployment defects were found through real inference: the upstream model gat
 
 Legacy file-backed API keys did not automatically populate the Flowise 3 API-key table. The existing key was imported offline into the migrated workspace with its original ID/secret and the minimum discovery permission. Encrypted model credentials retained their existing encryption key.
 
+## Container and repository cleanup follow-up
+
+The corrected Dockerfile was built with Docker Desktop's Linux engine from
+the copied checkout and frozen lock file. The image runs as UID/GID
+`10001:10001`, starts the installed `mcp-flowise` command, has no exposed
+ports, and accepts credentials at runtime. The final image is approximately
+156 MB; it does not fetch Git source at startup.
+
+A real MCP client connected through `docker run --rm -i` to version 0.1.2.
+Both simple and dynamic modes discovered the live catalog and returned
+nonempty model text from the selected protected and unprotected chatflows
+(four predictions). The offline suite passes **46 checks**, with **five
+explicitly opt-in live checks skipped**. CI covers Python 3.12 and 3.13.
+Obsolete import-time scripts and a test that only asserted its own mock
+response were removed. Legacy HTTP checks now require explicit live-test
+opt-in and a selected harmless flow; they never choose an arbitrary flow.
+
+The older runtime draft and incompatible `dev` experiment are retained in
+`archive/runtime-draft-2026-10-14` and `archive/dev-2026-10-20` tags. Current
+runtime behavior comes from the verified 0.1.2 changes; the remaining draft
+packaging work was reconciled separately. Repository Docker support does
+not imply that a third-party directory account has been claimed or configured.
+
 ## Limits and concerns
 
 - All flows were inventoried; only two harmless chatflows were exercised for inference. Agent side effects, retrieval stores, Zep memory, every external credential, and the remaining flows were not validated.

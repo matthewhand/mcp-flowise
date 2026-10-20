@@ -1,39 +1,24 @@
 name: Python Tests
-
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
-
+    branches: [main]
 jobs:
   test:
     runs-on: ubuntu-latest
-
+    strategy:
+      matrix:
+        python: ['3.12', '3.13']
     steps:
-      # Checkout the repository
       - uses: actions/checkout@v4
-
-      # Set up Python environment
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-
-      # Install uv
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
-
-      # Set up Python environment with uv
-      - name: Set up Python
-        run: uv python install
-
-      # Sync dependencies with uv
-      - name: Install dependencies
-        run: uv sync --all-extras --dev
-
-      # Run tests
-      - name: Run tests
-        run: uv run pytest tests/unit
-        env:
-          PYTHONPATH: ${{ github.workspace }}
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: '0.8.15'
+      - name: Install locked dependencies
+        run: uv sync --frozen --group dev --python ${{ matrix.python }}
+      - name: Run offline suite including stdio protocol checks
+        run: uv run --frozen pytest -q
