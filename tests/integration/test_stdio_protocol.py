@@ -9,6 +9,7 @@ import threading
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp_flowise.protocol import PACKAGE_VERSION
 import pytest
 
 
@@ -51,6 +52,7 @@ def test_stdio_success_and_upstream_errors(simple, tmp_path):
                 initialized = await session.initialize()
                 assert initialized.capabilities.tools is not None
                 assert initialized.serverInfo.name == 'fixture-flowise'
+                assert initialized.serverInfo.version == PACKAGE_VERSION
                 assert state['get_calls'] == 0, 'MCP initialization must not contact Flowise'
                 tools = (await session.list_tools()).tools
                 if simple:

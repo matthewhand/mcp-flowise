@@ -25,6 +25,8 @@ Default static tool names remain `list_chatflows` and `create_prediction`. Exist
 
 The proxy's [0.4 migration](https://github.com/matthewhand/mcp-openapi-proxy/blob/c37256c/docs/MIGRATION-0.4.md) changes SDK imports, handler signatures, model field names, capability registration and HTTP behavior. Copying its dependency requirement alone would break the current Flowise adapter. SDK 2 and native HTTP are not enabled by this patch. A coordinated migration needs both-mode protocol/client checks and an explicit HTTP authentication design; the Flowise API key protects the upstream connection, not a new MCP HTTP listener.
 
+Run the two packages in separate `uvx`/virtual environments: their current SDK-major requirements differ.
+
 OpenAPI parsing, schema resources, generic API authentication, shell-command audit logs and operation-specific header/body handling are not needed for the Flowise chatflow interface. They would add dependencies and configuration unrelated to this adapter's job.
 
 The proxy's disk fallback for API descriptions is not used for Flowise visibility: stale discovery must not authorize a flow that has since been removed or excluded. Each prediction keeps its fresh visibility check. Failed discovery also is not cached permanently. No automatic prediction retry is introduced, because a flow may already have produced side effects before a timeout.
@@ -33,4 +35,4 @@ The proxy's disk fallback for API descriptions is not used for Flowise visibilit
 
 The 0.1.2 follow-up passes **42 unit/local protocol checks** on Windows Python 3.12.9, including the added discovery, empty inventory, recovery, concurrent discovery, naming, timeout, logging and annotation regressions. Actual MCP subprocess initialization makes zero Flowise requests. Both modes advertise the configured identity and appropriate tool annotations.
 
-The protected/unprotected live matrix also passed: four test executions with actual predictions against the existing Flowise service, covering both modes, filtering and invalid calls. The [earlier verification report](verification-2026-10-20.md) remains the baseline record for 0.1.1. Linux and installed-adapter checks are completed before rollout.
+The protected/unprotected live matrix also passed: four test executions with actual predictions against the existing Flowise service, covering both modes, filtering and invalid calls. A separate Linux Python 3.12.8 checkout passed the same 42 offline checks and four live test executions before rollout. The [earlier verification report](verification-2026-10-20.md) remains the baseline record for 0.1.1.
