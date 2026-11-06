@@ -1,3 +1,5 @@
+![MCP clients discover and run Flowise chatflows through mcp-flowise](docs/assets/mcp-flowise-banner.png)
+
 # mcp-flowise
 
 [![smithery badge](https://smithery.ai/badge/@matthewhand/mcp-flowise)](https://smithery.ai/server/@matthewhand/mcp-flowise)
