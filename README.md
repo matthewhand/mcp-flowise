@@ -1,4 +1,4 @@
-![MCP clients discover and run Flowise chatflows through mcp-flowise](docs/assets/mcp-flowise-banner.png)
+![Flowise chatflows are exposed as LLM tools through mcp-flowise](docs/assets/mcp-flowise-banner.png)
 
 # mcp-flowise
 
